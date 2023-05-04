@@ -2,8 +2,8 @@
   "model_hyperparams": {
   "ICGNN_embedding_size": null,
   "additional_spline_flow": 0,
-  "allow_instantaneous": true,
-  "base_distribution_type": "conditional_spline",
+  "allow_instantaneous": false,
+  "base_distribution_type": "gaussian",
   "cate_rff_lengthscale": [
     0.1,
     1
@@ -33,17 +33,18 @@
     0,
     0
   ],
-  "lag": 2,
+  "lag": 96,
   "lambda_dag": 10,
   "lambda_prior": 100000,
-  "lambda_sparse": 25,
+  "lambda_sparse": 1,
   "norm_layers": true,
   "prior_A_confidence": 0.5,
   "random_seed": 4,
   "res_connection": true,
   "spline_bins": 8,
   "tau_gumbel": 0.25,
-  "var_dist_A_mode": "temporal_three"
+  "var_dist_A_mode": "temporal_three",
+  "pre_len": 96
 },
   "training_hyperparams": {
     "learning_rate": 0.001,
@@ -57,7 +58,7 @@
     "safety_alpha": 10000000000000.0,
     "tol_dag": -1,
     "progress_rate": 0.65,
-    "max_steps_auglag": 60,
+    "max_steps_auglag": 5,
     "max_auglag_inner_epochs": 2000,
     "max_p_train_dropout": 0,
     "reconstruction_loss_factor": 1.0,

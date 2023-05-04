@@ -138,7 +138,6 @@ class TemporalContractiveInvertibleGNN(nn.Module):
         encoder_layer_sizes: Optional[List[int]] = None,
         decoder_layer_sizes: Optional[List[int]] = None,
         embedding_size: Optional[int] = None,
-        pre_len: int = 1
     ):
         """
         Init method for TemporalContractiveInvertibleGNN.
@@ -158,7 +157,6 @@ class TemporalContractiveInvertibleGNN(nn.Module):
         assert lag > 0, "Lag must be greater than 0"
         self.lag = lag
         self.embedding_size = embedding_size
-        self.pre_len = pre_len
 
         # Initialize the associated weights by calling self.W = self._initialize_W(). self.W has shape [lag+1, num_nodes, num_nodes]
         self.W = self._initialize_W()
@@ -172,7 +170,6 @@ class TemporalContractiveInvertibleGNN(nn.Module):
             layers_g=encoder_layer_sizes,
             layers_f=decoder_layer_sizes,
             embedding_size=self.embedding_size,
-            pre_len = self.pre_len
         )
 
     def _initialize_W(self) -> torch.Tensor:
@@ -180,7 +177,7 @@ class TemporalContractiveInvertibleGNN(nn.Module):
         Initializes the associated weight with shape [lag+1, num_nodes, num_nodes]. Currently, initialize to zero.
         Returns: the initialized weight with shape [lag+1, num_nodes, num_nodes]
         """
-        W = torch.zeros(self.lag, self.num_nodes, self.num_nodes, device=self.device)
+        W = torch.zeros(self.lag + 1, self.num_nodes, self.num_nodes, device=self.device)
         return nn.Parameter(W, requires_grad=True)
 
     def get_weighted_adjacency(self) -> torch.Tensor:
@@ -188,9 +185,12 @@ class TemporalContractiveInvertibleGNN(nn.Module):
         This function returns the weights for the temporal adjacency matrix. Note that we need to disable the diagonal elements
         corresponding to the instantaneous adj matrix (W[0,...]), and keep the full matrix for the lagged adj matrix (W[1,...]).
         Returns:
-            Weight with shape [lag, num_nodes, num_nodes]
+            Weight with shape [lag+1, num_nodes, num_nodes]
         """
-        return self.W
+        # Disable the diagonal elements. This is to avoid the following inplace operation changing the original self.W.
+        W_adj = self.W.clone()  # Shape [lag+1, num_nodes, num_nodes].
+        torch.diagonal(W_adj[0, ...]).zero_()  # Disable the diagonal elements of W[0,...]
+        return W_adj
 
     def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
         """
@@ -207,8 +207,8 @@ class TemporalContractiveInvertibleGNN(nn.Module):
         # Requirement: self.f.feed_backward(X, W_adj). If W_adj has shape [lag+1, num_nodes, num_nodes], then it is applied for all batches
         # in X. If W_adj has shape [N_batch, lag+1, num_nodes, num_nodes], then each W_adj[i, ...] is applied for X[i, ...].
         if len(X.shape) == 2:
-            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
-        return self.f.feed_forward(X, W_adj).squeeze(0) # batch nodes pre_len
+            X = X.unsqueeze(0)  # [1, lag+1, processed_dim_all]
+        return self.f.feed_forward(X, W_adj).squeeze(0)
 
     # #change
     # def simulate_SEM_conditional(
@@ -442,7 +442,6 @@ class FGNNI(nn.Module):
         res_connection: bool = False,
         layers_g: Optional[List[int]] = None,
         layers_f: Optional[List[int]] = None,
-        pre_len: int = 1,
     ):
         """
         Args:
@@ -480,19 +479,9 @@ class FGNNI(nn.Module):
             normalization=norm_layer,
             res_connection=res_connection,
         )
-        # self.f = [generate_fully_connected(
-        #     input_dim=in_dim_f,
-        #     output_dim=1,
-        #     hidden_dims=layers_f,
-        #     non_linearity=nn.LeakyReLU,
-        #     activation=nn.Identity,
-        #     device=self.device,
-        #     normalization=norm_layer,
-        #     res_connection=res_connection,
-        # ) for i in range(self.num_nodes)]
         self.f = generate_fully_connected(
             input_dim=in_dim_f,
-            output_dim=pre_len,
+            output_dim=self.processed_dim_all,
             hidden_dims=layers_f,
             non_linearity=nn.LeakyReLU,
             activation=nn.Identity,
@@ -532,7 +521,7 @@ class FGNNI(nn.Module):
         X_rec = self.f(X_in_f)  # Shape (batch_size, num_nodes, processed_dim_all)
         # Mask and aggregate
         X_rec = X_rec * self.group_mask  # Shape (batch_size, num_nodes, processed_dim_all)
-        return X_rec.sum(1)  # Shape (batch_size, processed_dim_all, seq_len)
+        return X_rec.sum(1)  # Shape (batch_size, processed_dim_all)
 
     def initialize_embeddings(self) -> torch.Tensor:
         """
@@ -562,7 +551,6 @@ class TemporalFGNNI(FGNNI):
         res_connection: bool = False,
         layers_g: Optional[List[int]] = None,
         layers_f: Optional[List[int]] = None,
-        pre_len:int=1
     ):
         """
         This initalize the temporal version of FGNNI.
@@ -579,7 +567,6 @@ class TemporalFGNNI(FGNNI):
             layers_f: The hidden layers of the f function.
         """
         self.lag = lag
-        self.pre_len = pre_len
         # Call init of the parent class. Note that we need to overwrite the initialize_embeddings() method so that
         # it is consistent with the temporal data format.
         super().__init__(
@@ -591,7 +578,6 @@ class TemporalFGNNI(FGNNI):
             res_connection=res_connection,
             layers_g=layers_g,
             layers_f=layers_f,
-            pre_len=pre_len
         )
 
     def initialize_embeddings(self) -> torch.Tensor:
@@ -612,16 +598,16 @@ class TemporalFGNNI(FGNNI):
             X: Data from data loader with shape [batch_size, lag+1, processed_dim_all].
             W_adj: The temporal adjacency matrix with shape [lag+1, num_nodes, num_nodes] or [batch_size, lag+1, num_nodes, num_nodes].
         """
-
         # Assert tht if W_adj has batch dimension and >1 and X.shape[0]>1, then W_adj.shape[0] must match X.shape[0].
         # Assert X must have batch dimension.
         # Expand the weighted adjacency matrix dims for later matmul operation.
+        self.group_mask[...] = 1
         if len(W_adj.shape) == 3:
             W_adj = W_adj.unsqueeze(0)  # shape (1, lag+1, num_nodes, num_nodes)
-        assert len(X.shape) == 3, "The shape of X must be [batch, lag, proc_dim]"
+        assert len(X.shape) == 3, "The shape of X must be [batch, lag+1, proc_dim]"
         assert (
             W_adj.shape[1] == X.shape[1]
-        ), f"The lag of W_adj ({W_adj.shape[1]}) is inconsistent to the lag of X ({X.shape[1]})"
+        ), f"The lag of W_adj ({W_adj.shape[1]-1}) is inconsistent to the lag of X ({X.shape[1]}-1)"
         assert (
             W_adj.shape[0] == 1 or W_adj.shape[0] == X.shape[0]
         ), "The batch size of W_adj is inconsistent with X batch size"
@@ -629,7 +615,8 @@ class TemporalFGNNI(FGNNI):
         # For network g input, we mask the input with group mask, and concatenate it with the node embeddings.
         # Transform through g function. Output has shape shape (batch_size, lag+1, num_nodes, out_dim_g)
         X = X.unsqueeze(-2)  # shape (batch_size, lag+1, 1, processed_dim_all)
-        X_masked = X * self.group_mask  # shape (batch_size, lag, num_nodes, processed_dim_all)
+        X_masked = X * self.group_mask  # shape (batch_size, lag+1, num_nodes, processed_dim_all)
+        X_masked = X_masked[:, :-1]
         E = self.embeddings.expand(
             X_masked.shape[0], -1, -1, -1
         )  # shape (batch_size, lag+1, num_nodes, embedding_size)
@@ -643,22 +630,20 @@ class TemporalFGNNI(FGNNI):
         # The flip is needed because W_adj[:,0,...] is the adj for instantaneous effect, but X[:, -1,...] is the data at current time step.
         # Output will have shape [batch_size, lag+1, num_nodes, out_dim_g]
         # Summation is done by summing over the lag dimension.
-
-
-        X_aggr_sum = torch.einsum("klij,klio->kjo", W_adj.flip([1]), X_emb)  # shape (batch_size, predict_num_nodes, out_dim_g)
+        W_adj = W_adj[:, 1:]
+        X_aggr_sum = torch.einsum("klij,klio->kjo", W_adj.flip([1]), X_emb)  # shape (batch_size, num_nodes, out_dim_g)
 
         # For network f input, we concatenate the results from the previous step  with the node embeddings, and feed it to f.
         # Output has shape (batch_size, num_nodes, processed_dim_all)
         X_in_f = torch.cat(
             [X_aggr_sum, E[:, 0, :, :]], dim=-1
-        )  # shape (batch_size, predict_num_nodes, embedding_size+out_dim_g)
-        X_rec = self.f(X_in_f)  # batch predict_nodes pre_len
-        # X_rec = torch.stack([self.f[i](X_in_f[:,i]) for i in range(self.num_nodes)],dim=1) # shape (batch_size, predict_num_nodes, 1)
+        )  # shape (batch_size, num_nodes, embedding_size+out_dim_g)
+        X_rec = self.f(X_in_f)  # shape (batch_size, num_nodes, processed_dim_all)
 
         # Masked the output with group_mask, followed by summation num_nodes to get correct node values.
         # output has shape (batch_size, processed_dim_all)
-        # X_rec *= self.group_mask  # shape (batch_size, num_nodes, processed_dim_all)
-        return X_rec # shape (batch_size, processed_dim_all, pre_len)
+        X_rec *= self.group_mask  # shape (batch_size, num_nodes, processed_dim_all)
+        return X_rec.sum(dim=1)  # shape (batch_size, processed_dim_all)
 
 
 class TemporalHyperNet(nn.Module):
@@ -730,16 +715,6 @@ class TemporalHyperNet(nn.Module):
             normalization=norm_layer,
             res_connection=res_connection,
         )
-        # self.f = [generate_fully_connected(
-        #     input_dim=in_dim_f,
-        #     output_dim=self.total_param,
-        #     hidden_dims=layers_f,
-        #     non_linearity=nn.LeakyReLU,
-        #     activation=nn.Identity,
-        #     device=self.device,
-        #     normalization=norm_layer,
-        #     res_connection=res_connection,
-        # )for i in range(self.num_nodes)]
         self.f = generate_fully_connected(
             input_dim=in_dim_f,
             output_dim=self.total_param,
@@ -750,8 +725,9 @@ class TemporalHyperNet(nn.Module):
             normalization=norm_layer,
             res_connection=res_connection,
         )
+
         # Initialize the associated weights by calling self.W = self._initialize_W(). self.W has shape [lag+1, num_nodes, num_nodes]
-        self.W = self._initialize_W() #[lag, num_nodes, num_nodes]
+        # self.W = self._initialize_W() #[lag, num_nodes, num_nodes]
 
     def _initialize_W(self) -> torch.Tensor:
         """
@@ -785,7 +761,7 @@ class TemporalHyperNet(nn.Module):
             A tuple of parameters with shape [N_batch, num_cts_node*param_dim_each].
                 The length of tuple is len(self.param_dim),
         """
-
+        self.group_mask[...] = 1
         assert "W" in X and "X" in X and len(X) == 2, "The key for input can only contain three keys, 'W', 'X'."
 
         X_hist = X["X"]
@@ -808,15 +784,14 @@ class TemporalHyperNet(nn.Module):
         W_lag_exp = W[:, 1:, :, :]  # shape [batch, lag, node, node]
         
         # # change  add weight
-        W_lag_exp = W_lag_exp*self.W.unsqueeze(0)
+        # W_lag_exp = W_lag_exp*self.W.unsqueeze(0)
 
         X_aggr_sum = torch.einsum(
             "klij,klio->kjo", W_lag_exp.flip([1]), X_emb
         )  # shape (batch_size, num_nodes, out_dim_g)
 
         X_in_f = torch.cat([X_aggr_sum, E_inst], dim=-1)  # shape (batch_size, num_nodes, embedding_size+out_dim_g)
-        X_rec = self.f(X_in_f)
-        # X_rec = torch.stack([self.f[i](X_in_f[:,i]) for i in range(self.num_nodes)],dim=1) # shape (batch_size, num_nodes, total_params)
+        X_rec = self.f(X_in_f)  # shape (batch_size, num_nodes, total_params)
         X_selected = X_rec[..., self.cts_node, :] * self.init_scale  # shape [batch_size, cts_node, total_params]
         param_list = torch.split(
             X_selected, self.param_dim, dim=-1

@@ -43,9 +43,25 @@ from ...utils.metrics import compute_target_metrics, save_confusion_plot, save_t
 from ...utils.nri_utils import edge_prediction_metrics, edge_prediction_metrics_multisample
 from ...utils.plot_functions import violin_plot_imputations
 from ...utils.torch_utils import set_random_seeds
+from ...utils.io_utils import save_json
 
 ALL_INTRVS = "all interventions"
 
+def run_eval_sample(
+        model,
+        dataset: Union[Dataset, SparseDataset],
+        infer_config: Dict[str, Any],
+        seed: int,
+):  
+    start_time = dt.datetime.utcnow()
+    set_random_seeds(seed)
+    result_path = os.path.join(model.save_dir,"train_output")
+    results=model.run_inference(dataset, infer_config)
+    save_json(
+        results,
+        os.path.join(result_path, "results.json")
+    )
+    mlflow.log_metric("impute/running-time", (dt.datetime.utcnow() - start_time).total_seconds() / 60)
 
 def run_eval_main(
     model: IModelForImputation,

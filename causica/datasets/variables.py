@@ -72,6 +72,7 @@ class Variables:
 
         # List of lists, where self.unprocessed_cols[i] gives the columns occupied by the ith variable in the unprocessed
         # data.
+
         self.unprocessed_cols = []
         start_col = 0
         for var in self._all_variables:
@@ -237,24 +238,25 @@ class Variables:
                 # If data type/min max/num categories specified explicitly, overwrite variables file
                 if "type" not in variable_metadata:
                     # Test if all unmasked elements are integers
-
-                    if np.all((var_data * var_mask) // 1 == var_data * var_mask):
-                        if (var_data * var_mask).max() <= 1:
-                            print(
-                                f'Type of variable {variable_metadata["name"]} inferred as binary. This can be '
-                                "changed manually in the dataset's variables.json file"
-                            )
-                            variable_metadata["type"] = "binary"
-                        else:
-                            # Note that we always infer integer values with a max value > 1 as categorical. This may want to be
-                            # reconsidered if support for ordinal variables is introduced at a later date.
-                            print(
-                                f'Type of variable {variable_metadata["name"]} inferred as categorical. This can be'
-                                " changed manually in the dataset's variables.json file"
-                            )
-                            variable_metadata["type"] = "categorical"
-                    else:
-                        variable_metadata["type"] = "continuous"
+                    variable_metadata["type"] = "continuous"
+                    # change
+                    # if np.all((var_data * var_mask) // 1 == var_data * var_mask):
+                    #     if (var_data * var_mask).max() <= 1:
+                    #         print(
+                    #             f'Type of variable {variable_metadata["name"]} inferred as binary. This can be '
+                    #             "changed manually in the dataset's variables.json file"
+                    #         )
+                    #         variable_metadata["type"] = "binary"
+                    #     else:
+                    #         # Note that we always infer integer values with a max value > 1 as categorical. This may want to be
+                    #         # reconsidered if support for ordinal variables is introduced at a later date.
+                    #         print(
+                    #             f'Type of variable {variable_metadata["name"]} inferred as categorical. This can be'
+                    #             " changed manually in the dataset's variables.json file"
+                    #         )
+                    #         variable_metadata["type"] = "categorical"
+                    # else:
+                    #     variable_metadata["type"] = "continuous"
 
                 if "lower" not in variable_metadata:
                     if variable_metadata["type"] == "binary":
@@ -363,7 +365,6 @@ class Variables:
                 "auxiliary_variables": aux_variables_metadata,
                 "used_cols": used_cols,
             }
-
         return variables_dict
 
     @property
@@ -466,6 +467,7 @@ class Variables:
         Return a mask of shape (num_groups, num_processed_cols) indicating which column
         corresponds to which group.
         """
+
         mask = np.zeros((self.num_groups, self.num_processed_cols), dtype=bool)
         for group_idx, group in enumerate(self.group_idxs):
             for var in group:

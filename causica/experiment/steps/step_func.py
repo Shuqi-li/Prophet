@@ -17,12 +17,13 @@ def load_data(
     download_dataset: Callable[[str, str], None],
 ):
     use_predefined_dataset = dataset_config.get("use_predefined_dataset", False)
-    dataset_test_fraction = dataset_config.get("test_fraction", 0.1) if not use_predefined_dataset else None
-    dataset_val_fraction = dataset_config.get("val_fraction", 0.0) if not use_predefined_dataset else None
+    dataset_test_fraction = dataset_config.get("test_fraction", 0.2) if not use_predefined_dataset else None
+    dataset_val_fraction = dataset_config.get("val_fraction", 0.2) if not use_predefined_dataset else None
     split_type = dataset_config.get("split_type", "rows")
     negative_sample = dataset_config.get("negative_sample", False)
     dataset_format = dataset_config.get("dataset_format", "csv")
-    if dataset_name == "temporal_causal_csv":
+
+    if dataset_format == "temporal_causal_csv":
         timeseries_column_index = dataset_config.get("timeseries_column_index", 0)
     else:
         timeseries_column_index = None

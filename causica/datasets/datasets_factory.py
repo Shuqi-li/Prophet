@@ -62,8 +62,8 @@ def load_dataset_from_config(
     if use_predefined_dataset:
         return load_predefined_dataset(data_dir, dataset_name, dataset_format, max_num_rows=max_num_rows, **kwargs)
 
-    test_frac = dataset_config.get("test_fraction", 0.1)
-    val_frac = dataset_config.get("val_fraction", 0.0)
+    test_frac = dataset_config.get("test_fraction", 0.2)
+    val_frac = dataset_config.get("val_fraction", 0.2)
 
     random_state = dataset_config.get("random_seed", 0)
     if isinstance(random_state, list):

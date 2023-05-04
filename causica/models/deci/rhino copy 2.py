@@ -25,9 +25,9 @@ from ...utils.nri_utils import convert_temporal_to_static_adjacency_matrix, edge
 from ..imodel import IModelForTimeseries
 from .base_distributions import TemporalConditionalSplineFlow
 from .deci import DECI
-from .generation_functions import TemporalContractiveInvertibleGNN, TemporalFGNNIwithTimesNet
+from .generation_functions import TemporalContractiveInvertibleGNN
 from .variational_distributions import AdjMatrix, TemporalThreeWayGrahpDist
-from sklearn.preprocessing import StandardScaler
+
 
 class Rhino(DECI, IModelForTimeseries):
     """
@@ -45,8 +45,6 @@ class Rhino(DECI, IModelForTimeseries):
         save_dir: str,
         device: torch.device,
         lag: int,
-        pre_len: int,
-        configs:Dict,
         allow_instantaneous: bool,
         imputation: bool = False,
         lambda_dag: float = 1.0,
@@ -115,8 +113,6 @@ class Rhino(DECI, IModelForTimeseries):
         self.conditional_decoder_layer_sizes = conditional_decoder_layer_sizes
         self.conditional_spline_order = conditional_spline_order
         self.additional_spline_flow = additional_spline_flow
-        self.configs = configs
-        
         # For V0 AR-DECI, we only support mode_adjacency="learn", so hardcoded this argument.
         super().__init__(
             model_id=model_id,
@@ -145,7 +141,6 @@ class Rhino(DECI, IModelForTimeseries):
             graph_constraint_matrix=graph_constraint_matrix,
             embedding_size=ICGNN_embedding_size,
             disable_diagonal_eval=disable_diagonal_eval,
-            pre_len=pre_len
         )
 
     def _generate_error_likelihoods(self, base_distribution_string: str, variables: Variables) -> Dict[str, nn.Module]:
@@ -213,25 +208,17 @@ class Rhino(DECI, IModelForTimeseries):
             An instance of the temporal ICGNN
         """
 
-        # return TemporalContractiveInvertibleGNN(
-        #     group_mask=torch.tensor(self.variables.group_mask),
-        #     lag=self.lag,
-        #     device=self.device,
-        #     norm_layer=self.norm_layer,
-        #     res_connection=self.res_connection,
-        #     encoder_layer_sizes=self.encoder_layer_sizes,
-        #     decoder_layer_sizes=self.decoder_layer_sizes,
-        #     embedding_size=self.embedding_size,
-        #     pre_len=self.pre_len
-        # )
-
-        return TemporalFGNNIwithTimesNet(
+        return TemporalContractiveInvertibleGNN(
             group_mask=torch.tensor(self.variables.group_mask),
             lag=self.lag,
-            configs= self.configs,
-            pre_len = self.pre_len
-        ).to(self.device)
-    
+            device=self.device,
+            norm_layer=self.norm_layer,
+            res_connection=self.res_connection,
+            encoder_layer_sizes=self.encoder_layer_sizes,
+            decoder_layer_sizes=self.decoder_layer_sizes,
+            embedding_size=self.embedding_size,
+        )
+
     def networkx_graph(self) -> nx.DiGraph:
         """
         This function converts the most probable graph to networkx graph. Due to the incompatibility of networkx and temporal
@@ -286,15 +273,22 @@ class Rhino(DECI, IModelForTimeseries):
         # we need to disable the diagonal elements of constraint[0, ...] rather than the entire constraint matrix in original DECI.
         # Also the original implementation only supports 2D matrix.
         if graph_constraint_matrix is None:
-            neg_constraint_matrix = np.ones((self.lag , self.num_nodes, self.num_nodes))
+            neg_constraint_matrix = np.ones((self.lag + 1, self.num_nodes, self.num_nodes))
+            if self.allow_instantaneous:
+                np.fill_diagonal(neg_constraint_matrix[0, ...], 0)
+            else:
+                neg_constraint_matrix[0, ...] = np.zeros((self.num_nodes, self.num_nodes))
             self.neg_constraint_matrix = torch.as_tensor(neg_constraint_matrix, device=self.device, dtype=torch.float32)
-            self.pos_constraint_matrix = torch.zeros((self.lag, self.num_nodes, self.num_nodes), device=self.device)
+            self.pos_constraint_matrix = torch.zeros((self.lag + 1, self.num_nodes, self.num_nodes), device=self.device)
         else:
             negative_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=1.0)
+            if not self.allow_instantaneous:
+                negative_constraint_matrix[0, ...] = np.zeros((self.num_nodes, self.num_nodes))
             self.neg_constraint_matrix = torch.as_tensor(
                 negative_constraint_matrix, device=self.device, dtype=torch.float32
             )
             # Disable diagonal elements in the instant graph constraint.
+            torch.diagonal(self.neg_constraint_matrix[0, ...]).zero_()
             positive_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=0.0)
             self.pos_constraint_matrix = torch.as_tensor(
                 positive_constraint_matrix, device=self.device, dtype=torch.float32
@@ -327,11 +321,11 @@ class Rhino(DECI, IModelForTimeseries):
 
         typed_regions = self.variables.processed_cols_by_type
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # [1, lag+pre_len, proc_dim]
+            x = x.unsqueeze(0)  # [1, lag+1, proc_dim]
         batch_size, _, proc_dim = x.shape
 
-        if predict.dim() == 2:
-            predict = predict.unsqueeze(0) #1 pre_len dim
+        if predict.dim() == 1:
+            predict = predict.unsqueeze(0)
 
         # Continuous
         cts_bin_log_prob = torch.zeros(batch_size, proc_dim).to(self.device)  # [batch, proc_dim]
@@ -341,13 +335,13 @@ class Rhino(DECI, IModelForTimeseries):
             if self.base_distribution_type == "conditional_spline":
                 assert W is not None
                 cts_bin_log_prob[..., continuous_range] = self.likelihoods["continuous"].log_prob(
-                    x[..., -self.pre_len:, continuous_range] - predict[..., continuous_range],
-                    X_history=x[..., :-self.pre_len, :],
+                    x[..., -1, continuous_range] - predict[..., continuous_range],
+                    X_history=x[..., 0:-1, :],
                     W=W,
                 )
             else:
                 cts_bin_log_prob[..., continuous_range] = self.likelihoods["continuous"].log_prob(
-                    x[..., -self.pre_len:, continuous_range] - predict[..., continuous_range]
+                    x[..., -1, continuous_range] - predict[..., continuous_range]
                 )
 
         # Binary
@@ -390,14 +384,13 @@ class Rhino(DECI, IModelForTimeseries):
         """
         typed_regions = self.variables.processed_cols_by_type
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # [1, lag+pre_len, proc_dim]
+            x = x.unsqueeze(0)  # [1, lag+1, proc_dim]
 
-        if predict.dim() == 2:
-            predict = predict.unsqueeze(0)  # batch, pre_len, prco_dim
+        if predict.dim() == 1:
+            predict = predict.unsqueeze(0)
 
         continuous_range = [i for region in typed_regions["continuous"] for i in region]
-        # return (x[..., -1, -1] - predict[..., -1]).pow(2)
-        return (x[..., -self.pre_len:, continuous_range] - predict[..., continuous_range]).pow(2).mean([-2,-1])
+        return (x[..., -1, continuous_range] - predict[..., continuous_range]).pow(2).sum(-1)
 
     def _sample_base(self, Nsamples: int, time_span: int = 1) -> torch.Tensor:
         """
@@ -468,10 +461,10 @@ class Rhino(DECI, IModelForTimeseries):
         """
         assert X_history is not None, "For V0 AR-DECI, empty history generation is not supported"
         # Assertions for Nsamples must be multiple of samples_per_graph.
-        # if most_likely_graph:
-        #     assert Nsamples == samples_per_graph_groups
-        # else:
-        assert (
+        if most_likely_graph:
+            assert Nsamples == samples_per_graph_groups
+        else:
+            assert (
                 Nsamples % samples_per_graph_groups == 0
             ), f"Nsamples ({Nsamples}) must be multiples of samples_per_graph ({samples_per_graph_groups})"
         # convert X_history to torch.Tensor
@@ -509,56 +502,159 @@ class Rhino(DECI, IModelForTimeseries):
         gt_zero_region = [j for i in self.variables.processed_cols_by_type["binary"] for j in i]
 
         with torch.no_grad():
-            if most_likely_graph:
-                num_graph_samples = 1
-                samples_per_graph_groups = Nsamples
-            else:
-                num_graph_samples = Nsamples // samples_per_graph_groups
+            num_graph_samples = Nsamples // samples_per_graph_groups
+            if self.base_distribution_type == "conditional_spline":
+                # Noise cannot be sampled outside the simulate_SEM due to history dependence.
+                # Need call self.ICGNN.simulate_SEM_conditional(...)
+                # Get conditional distribution
+                conditional_dist = self.likelihoods["continuous"]
+                cts_node = conditional_dist.cts_node
+                Z = self._sample_base(
+                        samples_per_graph_groups * N_history_batch, time_span=time_span
+                    ) # [batch*samples_per_graph, time_span, proc_dim]
+                X_all = torch.cat(
+                    [X_history, torch.zeros(N_history_batch, time_span, proc_dim).to(self.device)], dim=1
+                 ).repeat(samples_per_graph_groups, 1,1) # shape [samples_per_graph* batch_size, time_span+history_length, processed_dim_all]
+                X_all_total = []
+                X_simulate_total = []
+                #X_history  shape [batch, history_length, proc_dims]
+                # Iterate over graph samples
+                if intervention_mask is not None and intervention_values is not None:
+                    assert (
+                        time_span >= intervention_mask.shape[0]
+                    ), "The future ahead time for observation generation must be >= the ahead time for intervention"
+                    # Convert the time_length in intervention mask to be compatible with X_all
+                    false_matrix_conditioning = torch.full(X_history.shape[1:], False, dtype=torch.bool, device=self.device)
+                    false_matrix_future = torch.full(
+                        (Z.shape[1] - intervention_mask.shape[0], Z.shape[2]), False, dtype=torch.bool, device=self.device
+                    )
+                    intervention_mask = torch.cat(
+                        (false_matrix_conditioning, intervention_mask, false_matrix_future), dim=0
+                    )  # shape [history_length+ time_span, processed_dim_all]
+
+                for num in range(num_graph_samples):
+                    Z_ = Z.clone()
+                    X_all_ =X_all.clone()
+                    for time in range(time_span):
+                        history_start_idx = len_history + time - self.lag
+                        inst_end_idx = len_history + time + 1
+                        history = X_all_[:, history_start_idx : inst_end_idx - 1] # batch*samples_per_graph, lag, node
+                        W_adj = self.get_weighted_adj_matrix(
+                            x_history=history[:N_history_batch],
+                            do_round=most_likely_graph,
+                            samples=1,
+                            most_likely_graph=most_likely_graph,
+                        ).view(-1, self.lag+1,proc_dim,proc_dim)  #[ batch, lag+1, nodes, nodes]
+                        # import pdb
+                        # pdb.set_trace()
+                        W_adj=W_adj.repeat(samples_per_graph_groups,1,1,1)
+
+                        Z_[:, time, cts_node] = conditional_dist.transform_noise(  # type:ignore
+                            Z=Z_[:, time, cts_node], X_history=history, W=W_adj
+                        )  # shape [batch_size, cts_dim]
+                        # Add intervention logic here.
+                        if intervention_mask is not None and intervention_values is not None:
+                            # Assign the intervention values to the corresponding indices in X_all, specified by intervention_mask
+                            X_all_[..., intervention_mask] = intervention_values
+                        # Generate the observations based on the history (given history + previously-generated observations)
+                        # and exogenous noise Z.
+                        generated_observations = self.ICGNN.f.feed_forward(X_all_[:, history_start_idx : inst_end_idx], W_adj=W_adj) + Z[:, time, :] # batch*samples_per_graph, lag, node
+
+                        # Logic for processing discrete and binary variables. This is similar to static version.
+                        if gumbel_max_regions is not None:
+                            for region in gumbel_max_regions:
+                                maxes = generated_observations[:, region].max(-1, keepdim=True)[0]  # shape [batch_size, 1]
+                                generated_observations[:, region] = (generated_observations[:, region] >= maxes).float()
+                        if gt_zero_region is not None:
+                            generated_observations[:, gt_zero_region] = (generated_observations[:, gt_zero_region] > 0).float()
+                        X_all[:, len_history + time, :] = generated_observations
+                    if intervention_mask is not None and intervention_values is not None:
+                        # assign intervention_values to X_all at corresponding index specified by intervention_mask
+                        X_all_[..., intervention_mask] = intervention_values
+
+                    X_simulate = X_all_[:, len_history:, :].clone()  # shape [batch_size, time_span, proc_dim]
+                    X_all_total.append(X_all_)
+                    X_simulate_total.append(X_simulate)
+                
+
      
-
-            Z = self._sample_base(
-                    samples_per_graph_groups * N_history_batch, time_span=time_span
-                ) # [batch*samples_per_graph, time_span, proc_dim]
-
-
-            
-            X_simulate_total = []
-            #X_history  shape [batch, history_length, proc_dims]
-            # Iterate over graph samples
-            if intervention_mask is not None and intervention_values is not None:
-                assert (
-                    time_span >= intervention_mask.shape[0]
-                ), "The future ahead time for observation generation must be >= the ahead time for intervention"
-                # Convert the time_length in intervention mask to be compatible with X_all
-                false_matrix_conditioning = torch.full(X_history.shape[1:], False, dtype=torch.bool, device=self.device)
-                false_matrix_future = torch.full(
-                    (Z.shape[1] - intervention_mask.shape[0], Z.shape[2]), False, dtype=torch.bool, device=self.device
-                )
-                intervention_mask = torch.cat(
-                    (false_matrix_conditioning, intervention_mask, false_matrix_future), dim=0
-                )  # shape [history_length+ time_span, processed_dim_all]
-
-            for num in range(num_graph_samples):
-                W_adj = self.get_weighted_adj_matrix(
-                    x_history=X_history[:, -self.lag:],
-                    do_round=most_likely_graph,
-                    samples=1,
-                    most_likely_graph=most_likely_graph,
-                ).view(-1, self.lag, proc_dim, proc_dim)  #[batch, lag, nodes, nodes]
+                samples = (
+                    torch.cat(X_simulate_total, dim=0).view(Nsamples, N_history_batch, time_span, proc_dim)
+                )  # shape [Nsamples, N_history_batch, time_span, proc_dim]
+            else:
 
 
-                # Generate the observations based on the history (given history + previously-generated observations)
-                # and exogenous noise Z.
-                predict = self.ICGNN.f.feed_forward(X_history[:, -self.lag:], W_adj=W_adj).transpose(-1, -2) #batch, time_span nodes
-    
-                X_simulate_total.append(predict) #samples_per_graph*batch, time_span pro_dim
+                Z = self._sample_base(
+                        samples_per_graph_groups * N_history_batch, time_span=time_span
+                    ) # [batch*samples_per_graph, time_span, proc_dim]
+                X_all = torch.cat(
+                    [X_history, torch.zeros(N_history_batch, time_span, proc_dim).to(self.device)], dim=1
+                 ).repeat(samples_per_graph_groups, 1,1) # shape [samples_per_graph* batch_size, time_span+history_length, processed_dim_all]
+                X_all_total = []
+                X_simulate_total = []
+                #X_history  shape [batch, history_length, proc_dims]
+                # Iterate over graph samples
+                if intervention_mask is not None and intervention_values is not None:
+                    assert (
+                        time_span >= intervention_mask.shape[0]
+                    ), "The future ahead time for observation generation must be >= the ahead time for intervention"
+                    # Convert the time_length in intervention mask to be compatible with X_all
+                    false_matrix_conditioning = torch.full(X_history.shape[1:], False, dtype=torch.bool, device=self.device)
+                    false_matrix_future = torch.full(
+                        (Z.shape[1] - intervention_mask.shape[0], Z.shape[2]), False, dtype=torch.bool, device=self.device
+                    )
+                    intervention_mask = torch.cat(
+                        (false_matrix_conditioning, intervention_mask, false_matrix_future), dim=0
+                    )  # shape [history_length+ time_span, processed_dim_all]
 
-    
-            predict_f = (
-                torch.cat(X_simulate_total, dim=0).view(-1, N_history_batch, time_span, proc_dim)
-            )  # shape [num_graph_samples, N_history_batch, time_span, proc_dim]
-            samples = predict_f
-            # samples = (predict_f.unsqueeze(0) + Z.view(-1, N_history_batch, time_span, proc_dim).unsqueeze(1)).view(-1, N_history_batch, time_span, proc_dim)
+                for num in range(num_graph_samples):
+                    Z_ = Z.clone()
+                    X_all_ =X_all.clone()
+                    for time in range(time_span):
+                        history_start_idx = len_history + time - self.lag
+                        inst_end_idx = len_history + time + 1
+                        history = X_all_[:, history_start_idx : inst_end_idx - 1] # batch*samples_per_graph, lag, node
+                        W_adj = self.get_weighted_adj_matrix(
+                            x_history=history[:N_history_batch],
+                            do_round=most_likely_graph,
+                            samples=1,
+                            most_likely_graph=most_likely_graph,
+                        ).view(-1, self.lag+1,proc_dim,proc_dim)  #[ batch, lag+1, nodes, nodes]
+                        # import pdb
+                        # pdb.set_trace()
+                        W_adj=W_adj.repeat(samples_per_graph_groups,1,1,1)
+
+
+                        # Add intervention logic here.
+                        if intervention_mask is not None and intervention_values is not None:
+                            # Assign the intervention values to the corresponding indices in X_all, specified by intervention_mask
+                            X_all_[..., intervention_mask] = intervention_values
+                        # Generate the observations based on the history (given history + previously-generated observations)
+                        # and exogenous noise Z.
+                        generated_observations = self.ICGNN.f.feed_forward(X_all_[:, history_start_idx : inst_end_idx], W_adj=W_adj) + Z[:, time, :] # batch*samples_per_graph, lag, node
+
+                        # Logic for processing discrete and binary variables. This is similar to static version.
+                        if gumbel_max_regions is not None:
+                            for region in gumbel_max_regions:
+                                maxes = generated_observations[:, region].max(-1, keepdim=True)[0]  # shape [batch_size, 1]
+                                generated_observations[:, region] = (generated_observations[:, region] >= maxes).float()
+                        if gt_zero_region is not None:
+                            generated_observations[:, gt_zero_region] = (generated_observations[:, gt_zero_region] > 0).float()
+                        X_all[:, len_history + time, :] = generated_observations
+                    if intervention_mask is not None and intervention_values is not None:
+                        # assign intervention_values to X_all at corresponding index specified by intervention_mask
+                        X_all_[..., intervention_mask] = intervention_values
+
+                    X_simulate = X_all_[:, len_history:, :].clone()  # shape [batch_size, time_span, proc_dim]
+                    X_all_total.append(X_all_)
+                    X_simulate_total.append(X_simulate)
+                
+
+     
+                samples = (
+                    torch.cat(X_simulate_total, dim=0).view(Nsamples, N_history_batch, time_span, proc_dim)
+                )  # shape [Nsamples, N_history_batch, time_span, proc_dim]
+
             # else:
 
             #     # Sample weighted graph from posterior with shape [num_graph_samples, lag+1, num_nodes, num_nodes]
@@ -705,33 +801,24 @@ class Rhino(DECI, IModelForTimeseries):
             dataloader: A dataloader that supports loading temporal data with shape [N_batch, lag+1, proc_dims].
             num_samples: The size of the training data set.
         """
-
         # The implementation is identical to the one in FT-DECI but with is_autoregressive=True.
         data, mask = self.process_dataset(dataset, train_config_dict)
-        scaler = StandardScaler()
-        scaler.fit(data)
-        data = scaler.transform(data)
-        # data, mask = dataset.train_data_and_mask
-     
         tensor_dataset = TemporalTensorDataset(
-                *to_tensors(data, mask, device=self.device),
-                lag=self.lag + self.pre_len-1,
-                is_autoregressive=True,
-                index_segmentation=dataset.train_segmentation,
-            )
-        
-            
+            *to_tensors(data, mask, device=self.device),
+            lag=self.lag,
+            is_autoregressive=True,
+            index_segmentation=dataset.train_segmentation,
+        )
         dataloader = DataLoader(tensor_dataset, batch_size=train_config_dict["batch_size"], shuffle=True)
 
         return dataloader, len(tensor_dataset)
 
-    def my_data_loader(self, data, batch_size, index_segmentation,time_span):
+    def my_data_loader(self, data, batch_size, index_segmentation):
         tensor_dataset = MyTemporalTensorDataset(
             *to_tensors(data, device=self.device),
             lag=self.lag,
             is_autoregressive=True,
             index_segmentation=index_segmentation,
-            time_span=time_span,
         )
         dataloader = DataLoader(tensor_dataset, batch_size=batch_size, shuffle=False)
         return dataloader
@@ -753,28 +840,24 @@ class Rhino(DECI, IModelForTimeseries):
         """
         # The implementation is identical to the one in FT-DECI but with is_autoregressive=True.
         dataloader = {
+            'train':{},
             'val':{},
             'test':{}
         }
         batch_size = infer_config_dict['batch_size']
-        time_span = infer_config_dict['time_span']
         processed_dataset = self.data_processor.process_dataset(dataset)
         train_data, _ = processed_dataset.train_data_and_mask
-        scaler = StandardScaler()
-        scaler.fit(train_data)
         val_data, _ = processed_dataset.val_data_and_mask
-        val_data = scaler.transform(val_data)
         test_data, _ = processed_dataset.test_data_and_mask
-        test_data = scaler.transform(test_data)
-        # dataloader['train']['data_len'] = len(train_data)
-        # dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation, time_span)
+        dataloader['train']['data_len'] = len(train_data)
+        dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation)
         
         if val_data is not None:
             dataloader['val']['data_len'] = len(val_data)
-            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation, time_span)
+            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation)
         if test_data is not None:
             dataloader['test']['data_len'] = len(test_data)
-            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation, time_span)
+            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation)
         return dataloader
 
     def set_prior_A(
@@ -891,24 +974,19 @@ class Rhino(DECI, IModelForTimeseries):
             'val':{},
             'test':{}
         }
-
         for k, item in dataloader.items():
             total_metric[k]['data_num'] = item['data_len']
             metric={}
             mse_sample = None
-            # acc_sample = None
-            # acc_mask = None
-            # target_all = None
-            # predicts_all = None
+            acc_sample = None
+            acc_mask = None
             for x_, target_ in item['loader']:
                 x=x_[0] #batch lag nodes
-                pre_value = x[:,-1].clone() #batch node
-                # #normalize
-                # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
-                # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
-                # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
-                # x = (x - x_mean)/x_std
-
+                pre_value = x[:,-1].clone()
+                #normalize
+                x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
+                x_std = x.std(1).unsqueeze(1)
+                x = (x-x_mean)/x_std
                 target=target_[0] # batch time_span nodes
                 predicts = self.sample(X_history=x,
                                     Nsamples=infer_config_dict['Nsamples'],
@@ -917,63 +995,37 @@ class Rhino(DECI, IModelForTimeseries):
                                     intervention_values=infer_config_dict['intervention_values'],
                                     samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'],
                                     time_span = infer_config_dict['time_span'])
-                
-                mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
-
-                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
-    
-                # target_all = torch.cat([target_all,target], dim = 0) if target_all != None else target
-                # predicts_all = torch.cat([predicts_all,predicts], dim = 1) if predicts_all != None else predicts
-
-            # for i, normalizer in enumerate(self.data_processor._cts_normalizers):
-            #     target_all[..., i] = normalizer.inverse_transform(target_all[[..., i]])
-            #     predicts_all[..., i] = normalizer.inverse_transform(predicts_all[..., i])
-            
-           
+                #shape [nsamples, batch, time_span, nodes]
 
                 # renormalize
-                # predicts = self.scaler.inverse_transform(predicts)
- 
+                predicts = predicts*x_std +x_mean
 
-                # mse_sample_ = (target-predicts).pow(2)
-                # mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
+                mse_sample_ = (target-predicts).pow(2)
+                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
 
-                # if infer_config_dict['movement'] == True:
-                #     move = target[:, 0]-pre_value
-                #     move_target = torch.where(move>=0, 1, 0)
-                #     acc_mask_ = ~(torch.where(move/pre_value<0.0055, 1, 0) * torch.where(move/pre_value>-0.005, 1, 0)) 
+                if infer_config_dict['movement'] == True:
+                    move = target[:, 0]-pre_value
+                    move_target = torch.where(move>0, 1, 0)
 
-                #     predict_move = predicts[:,:,0]-pre_value  #sample batch nodes
-                #     move_predict  = torch.where(predict_move>=0, 1, 0) #sample batch nodes
-                #     acc_sample_ = (move_target == move_predict).float()
-                #     acc_sample = torch.cat([acc_sample,acc_sample_], dim=1) if acc_sample!=None else acc_sample_
-                #     acc_mask = torch.cat([acc_mask,acc_mask_], dim=0) if acc_mask!=None else acc_mask_
-
-            # metric['rmse'] = torch.sqrt(mse_sample.mean([1,2,3])).mean(0).tolist()
-
-
-            # # 每个节点的mse均值和采样方差
-            # metric['rmse_pre_node'] =torch.sqrt(mse_sample).mean(0).tolist()
-            # metric['rmse_var_pre_node'] =torch.sqrt(mse_sample).var(0).tolist()
-
-            # samples batch nodes
-            metric['mse_mean_pre_node'] = mse_sample.mean(1).mean(0).tolist()
-            # metric['mse_var_pre_node'] = mse_sample.mean(1).var(0).tolist()
-            # 所有节点的mse均值和采样方差
-            metric['mse_mean'] = mse_sample.mean([1,2]).mean(0).tolist()
-            # metric['mse_var'] = mse_sample.mean([1,2]).var(0).tolist()
-           
-            # if infer_config_dict['movement'] == True:
-            #     acc_mask[...] =1
-            #     acc_sample = acc_sample * acc_mask # sample, batch, nodes
-            #     # acc_mask (batch nodes)
-            #     # acc_sample = acc_sample.mean(1)
-            #     metric['acc_mean_per_node'] = (acc_sample.sum(1)/acc_mask.sum(0)).mean(0).tolist()
-            #     metric['acc_var_per_node'] =(acc_sample.sum(1)/acc_mask.sum(0)).var(0).tolist()
-            #     metric['acc_mean'] = (acc_sample.sum([1,2])/acc_mask.sum()).mean(0).tolist()
-            #     metric['acc_var'] = (acc_sample.sum([1,2])/acc_mask.sum()).var(0).tolist()
+                    predict_move = predicts[:,:,0]-pre_value  #sample batch nodes
+                    move_predict  = torch.where(predict_move>0, 1, 0) #sample batch nodes
+                    acc_sample_ = (move_target == move_predict).float()
+                    acc_sample = torch.cat([acc_sample,acc_sample_], dim=1) if acc_sample!=None else acc_sample_
+            mse_sample = mse_sample.mean([1,2])
             
-            total_metric[k]['metric']=metric
+            # 每个节点的mse均值和采样方差
+            metric['mse_mean_pre_node'] = mse_sample.mean(0).tolist()
+            metric['mse_var_pre_node'] = mse_sample.var(0).tolist()
+            # 所有节点的mse均值和采样方差
+            metric['mse_mean'] = mse_sample.mean(1).mean(0).tolist()
+            metric['mse_var'] = mse_sample.mean(1).var(0).tolist()
+            if infer_config_dict['movement'] == True:
+                acc_sample = acc_sample.mean(1)
+                metric['acc_mean_per_node'] = acc_sample.mean(0).tolist()
+                metric['acc_var_per_node'] =acc_sample.var(0).tolist()
+                metric['acc_mean'] = acc_sample.mean(1).mean(0).tolist()
+                metric['acc_var'] = acc_sample.mean(1).var(0).tolist()
+                total_metric[k]['metric']=metric
 
                     
 
@@ -1065,11 +1117,15 @@ class Rhino(DECI, IModelForTimeseries):
         """
         # Get adjacency matrix with weights
 
+        # normalize
+        x_history = X[:, :-1] #batch lag nodes
+        x_mean = x_history.mean(1).unsqueeze(1) #batch 1 nodes
+        x_std = x_history.std(1).unsqueeze(1) #batch 1 nodes
+        X = (X-x_mean)/x_std
 
-        x_history = X[:, :-self.pre_len]
 
-        A_sample = self.get_adj_matrix_tensor(x_history=x_history, do_round=False, samples=1, most_likely_graph=False).squeeze(0)
-        #[batch, lag, nodes, nodes]
+        A_sample = self.get_adj_matrix_tensor(x_history=X[:, :-1], do_round=False, samples=1, most_likely_graph=False).squeeze(0)
+        #[batch, lag+1, nodes, nodes]
         if self.mode_adjacency == "learn":
             factor_q = 1.0
         elif self.mode_adjacency in ["upper", "lower"]:
@@ -1077,22 +1133,19 @@ class Rhino(DECI, IModelForTimeseries):
         else:
             raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
  
-        W_adj = A_sample * self.ICGNN.get_weighted_adjacency()  #[batch, lag, nodes, nodes]
-        predict = self.ICGNN.predict(x_history, W_adj).transpose(-1,-2)  # batch pre_len nodes
+        W_adj = A_sample * self.ICGNN.get_weighted_adjacency()  #[batch, lag+1, nodes, nodes]
+        predict = self.ICGNN.predict(X, W_adj)
         log_p_A = self._log_prior_A(A_sample)  # A number
 
         
         log_p_base = self._log_prob(
                 X,
                 predict,
-                W=A_sample if self.base_distribution_type == "conditional_spline" else None,
+                W=W_adj if self.base_distribution_type == "conditional_spline" else None,
             )  # (B)
 
             # self.ICGNN.predict(X, W_adj)
         log_q_A = self.var_dist_A.entropy()  # A number
-        
-
-        # renormalize
 
         cts_mse = self._icgnn_cts_mse(X, predict)  # (B)
 
@@ -1151,15 +1204,15 @@ class Rhino(DECI, IModelForTimeseries):
 
 
         if train_config_dict["anneal_entropy"] == "linear":
-            ELBO = log_p_term  - log_q_A_term / max(step - 5, 1) #-  log_p_A_term
+            ELBO = log_p_term -  log_p_A_term - log_q_A_term / max(step - 5, 1) 
         elif train_config_dict["anneal_entropy"] == "noanneal":
-            ELBO = log_p_term  - log_q_A_term #- log_p_A_term
+            ELBO = log_p_term - log_p_A_term - log_q_A_term 
         loss = -ELBO
 
 
         tracker["loss"].append(loss.item())
         
-        # loss = loss +  cts_mse
+        loss = loss +  cts_mse
 
         tracker["log_p_A_sparse"].append(log_p_A_term.item())
         tracker["log_p_x"].append(log_p_term.item())

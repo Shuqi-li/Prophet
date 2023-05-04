@@ -229,6 +229,7 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset_config", "-dc", type=str, help="Path to JSON containing dataset configuration.")
     parser.add_argument("--impute_config", "-ic", type=str, help="Path to JSON containing impute configuration.")
     parser.add_argument("--objective_config", "-oc", type=str, help="Path to JSON containing objective configuration.")
+    parser.add_argument("--infer_config", "-ifc", type=str, help="Path to JSON containing inference configuration.")
 
     # Whether or not to run inference and active learning
     parser.add_argument("--run_inference", "-i", action="store_true", help="Run inference after training.")

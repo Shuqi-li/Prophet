@@ -106,8 +106,9 @@ class DECI(
         graph_constraint_matrix: Optional[np.ndarray] = None,
         dense_init: bool = False,
         embedding_size: Optional[int] = None,
-        log_scale_init: float = 0,
+        log_scale_init: float =  -10.0,
         disable_diagonal_eval: bool = True,
+        pre_len:int = 1,
     ):
         """
         Args:
@@ -181,6 +182,7 @@ class DECI(
         # Set up the Neural Nets
         self.res_connection = res_connection
         self.norm_layer = nn.LayerNorm if norm_layers else None
+        self.pre_len = pre_len
         self.ICGNN = self._create_ICGNN_for_deci()
 
         self.spline_bins = spline_bins
@@ -531,10 +533,10 @@ class DECI(
             Log probability of A for prior distribution, a number.
         """
 
-        sparse_term = -self.lambda_sparse * A.abs().sum()
+        sparse_term = self.lambda_sparse * A.abs().sum()
         if self.exist_prior:
             prior_term = (
-                -self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
+                self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
             )
             return sparse_term + prior_term
         else:
@@ -1318,21 +1320,12 @@ class DECI(
         """Prints formatted contents of loss terms that are being tracked."""
         tracker_copy = tracker.copy()
 
-        loss = np.mean(tracker_copy.pop("loss")[-100:])
-        log_p_x = np.mean(tracker_copy.pop("log_p_x")[-100:])
-        penalty_dag = np.mean(tracker_copy.pop("penalty_dag")[-100:])
-        log_p_A_sparse = np.mean(tracker_copy.pop("log_p_A_sparse")[-100:])
-        log_q_A = np.mean(tracker_copy.pop("log_q_A")[-100:])
-        h_filled = np.mean(tracker_copy.pop("imputation_entropy")[-100:])
-        reconstr = np.mean(tracker_copy.pop("reconstruction_mse")[-100:])
-
         out = (
-            f"Inner Step: {inner_step}, loss: {loss:.2f}, log p(x|A): {log_p_x:.2f}, dag: {penalty_dag:.8f}, "
-            f"log p(A)_sp: {log_p_A_sparse:.2f}, log q(A): {log_q_A:.3f}, H filled: {h_filled:.3f}, rec: {reconstr:.3f}"
+            f"Inner Step: {inner_step}"
         )
 
         for k, v in tracker_copy.items():
-            out += f", {k}: {np.mean(v[-100:]):.3g}"
+            out += f", {k}: {np.mean(v[-100:]):.4f}"
 
         print(out)
 
@@ -1547,53 +1540,53 @@ class DECI(
                 rho, alpha, beta, step, num_samples, dataloader, train_config_dict, adj_true, bidirected_adj_true
             )
             outer_step_time = time.time() - outer_step_start_time
-            dag_penalty = np.mean(tracker_loss_terms["penalty_dag"])
+            # dag_penalty = np.mean(tracker_loss_terms["penalty_dag"])
 
             # Print some stats about the DAG distribution
-            print(f"Dag penalty after inner: {dag_penalty:.10f}")
+            # print(f"Dag penalty after inner: {dag_penalty:.10f}")
             print("Time taken for this step", outer_step_time)
-            try:
-                directed_adjacency, bidirected_adjacency = cast(Any, self).get_admg_matrices(
-                    do_round=False, most_likely_graph=True, samples=1
-                )
-                print("Unrounded directed matrix:")
-                print(directed_adjacency)
-                print("Unrounded bidirected matrix:")
-                print(bidirected_adjacency)
+            # try:
+            #     directed_adjacency, bidirected_adjacency = cast(Any, self).get_admg_matrices(
+            #         do_round=False, most_likely_graph=True, samples=1
+            #     )
+            #     print("Unrounded directed matrix:")
+            #     print(directed_adjacency)
+            #     print("Unrounded bidirected matrix:")
+            #     print(bidirected_adjacency)
 
-            except AttributeError:
-                matrix = self.get_adj_matrix(do_round=True, most_likely_graph=True, samples=1)
-                prob_matrix = self.get_adj_matrix(do_round=False, most_likely_graph=True, samples=1)
-                print("Unrounded adj matrix:")
-                print(prob_matrix)
-                print(f"Number of edges in adj matrix (unrounded) {prob_matrix.sum()}, (rounded) {matrix.sum()}.")
+            # except AttributeError:
+            #     matrix = self.get_adj_matrix(do_round=True, most_likely_graph=True, samples=1)
+            #     prob_matrix = self.get_adj_matrix(do_round=False, most_likely_graph=True, samples=1)
+            #     print("Unrounded adj matrix:")
+            #     print(prob_matrix)
+            #     print(f"Number of edges in adj matrix (unrounded) {prob_matrix.sum()}, (rounded) {matrix.sum()}.")
 
-            # Update alpha (and possibly rho) if inner optimization done or if 2 consecutive not-done
-            if done_inner or num_not_done == 1:
-                num_not_done = 0
-                if dag_penalty < train_config_dict["tol_dag"]:
-                    num_below_tol += 1
-                if report_progress_callback is not None:
-                    report_progress_callback(self.model_id, step + 1, train_config_dict["max_steps_auglag"])
+            # # Update alpha (and possibly rho) if inner optimization done or if 2 consecutive not-done
+            # if done_inner or num_not_done == 1:
+            #     num_not_done = 0
+            #     if dag_penalty < train_config_dict["tol_dag"]:
+            #         num_below_tol += 1
+            #     if report_progress_callback is not None:
+            #         report_progress_callback(self.model_id, step + 1, train_config_dict["max_steps_auglag"])
 
-                with torch.no_grad():
-                    if dag_penalty > dag_penalty_prev * progress_rate:
-                        print(f"Updating rho, dag penalty prev: {dag_penalty_prev: .10f}")
-                        rho *= 10.0
-                    else:
-                        print("Updating alpha.")
-                        dag_penalty_prev = dag_penalty
-                        alpha += rho * dag_penalty
-                        if dag_penalty == 0.0:
-                            alpha *= 5
-                    if rho >= train_config_dict["safety_rho"]:
-                        alpha *= 5
-                    rho = min([rho, train_config_dict["safety_rho"]])
-                    alpha = min([alpha, train_config_dict["safety_alpha"]])
+            #     with torch.no_grad():
+            #         if dag_penalty > dag_penalty_prev * progress_rate:
+            #             print(f"Updating rho, dag penalty prev: {dag_penalty_prev: .10f}")
+            #             rho *= 10.0
+            #         else:
+            #             print("Updating alpha.")
+            #             dag_penalty_prev = dag_penalty
+            #             alpha += rho * dag_penalty
+            #             if dag_penalty == 0.0:
+            #                 alpha *= 5
+            #         if rho >= train_config_dict["safety_rho"]:
+            #             alpha *= 5
+            #         rho = min([rho, train_config_dict["safety_rho"]])
+            #         alpha = min([alpha, train_config_dict["safety_alpha"]])
 
-            else:
-                num_not_done += 1
-                print("Not done inner optimization.")
+            # else:
+            #     num_not_done += 1
+            #     print("Not done inner optimization.")
 
             if (
                 isinstance(dataset, LatentConfoundedCausalDataset)
@@ -1648,10 +1641,10 @@ class DECI(
             # Save model
             self.save()
 
-            # Print the current values of the auglag parameters rho, alpha
-            if dag_penalty_prev is not None:
-                print(f"Dag penalty: {dag_penalty:.15f}")
-                print(f"Rho: {rho:.2f}, alpha: {alpha:.2f}")
+            # # Print the current values of the auglag parameters rho, alpha
+            # if dag_penalty_prev is not None:
+            #     print(f"Dag penalty: {dag_penalty:.15f}")
+            #     print(f"Rho: {rho:.2f}, alpha: {alpha:.2f}")
 
     def optimize_inner_auglag(
         self,

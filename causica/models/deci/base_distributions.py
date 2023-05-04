@@ -14,7 +14,7 @@ from .generation_functions import TemporalHyperNet
 
 # TODO: Add tests for base distributions, and ensure we are not duplicating any pytorch.distributions functionality unnecessarily
 class GaussianBase(nn.Module):
-    def __init__(self, input_dim: int, device: torch.device, train_base: bool = True, log_scale_init: float = 0.0):
+    def __init__(self, input_dim: int, device: torch.device, train_base: bool = True, log_scale_init: float = -10.0):
         """
         Gaussian base distribution with 0 mean and optionally learnt variance. The distribution is factorised to ensure SEM invertibility.
             The mean is fixed. This class provides an interface analogous to torch.distributions, exposing .sample and .log_prob methods.
@@ -41,8 +41,7 @@ class GaussianBase(nn.Module):
 
         mean = nn.Parameter(torch.zeros(self.input_dim, device=self.device), requires_grad=False)
         logscale = nn.Parameter(
-            self.log_scale_init * torch.ones(self.input_dim, device=self.device), requires_grad=train
-        )
+            self.log_scale_init * torch.ones(self.input_dim, device=self.device), requires_grad=train)
         return mean, logscale
 
     def log_prob(self, z: torch.Tensor):
@@ -50,13 +49,13 @@ class GaussianBase(nn.Module):
         Returns a the log-density per sample and dimension of z
 
         Args:
-            z (batch, input_dim)
+            z (batch, pre_len, input_dim)
 
         Returns:
             log_prob (batch, input_dim)
         """
         dist = td.Normal(self.mean_base, torch.exp(self.logscale_base))
-        return dist.log_prob(z)
+        return dist.log_prob(z).sum(-2)
 
     def sample(self, Nsamples: int):
         """
@@ -209,6 +208,7 @@ class TemporalConditionalSplineFlow(nn.Module):
             layers_g=layers_g,
         ).to(device)
 
+
         self.additional_flow = additional_flow
         # The default base dist is Gaussian with zero mean and unit variance
         self.base_dist = distrib.Normal(
@@ -249,6 +249,7 @@ class TemporalConditionalSplineFlow(nn.Module):
         # Transform conditional placeholder to actual conditional distribution
         context_dict = {"X": X_history, "W": W}
         flow_dist = distrib.ConditionalTransformedDistribution(self.base_dist, self.transform).condition(context_dict)
+   
         return flow_dist.log_prob(X_input)
 
     def sample(self, Nsamples: int, X_history: torch.Tensor, W: torch.Tensor) -> torch.Tensor:

@@ -22,7 +22,7 @@ def run_train_main(
     prior_path: Optional[str] = None,
     constraint_path: Optional[str] = None,
 ) -> IModel:
-
+    
     # Create model
     logger.info("Creating new model")
     model = create_model(model_type, output_dir, variables, device, model_config)
@@ -36,7 +36,7 @@ def run_train_main(
     if isinstance(model, TorchModel):
         num_trainable_parameters = sum(p.numel() for p in model.parameters())
         mlflow.set_tags({"num_trainable_parameters": num_trainable_parameters})
-    dataset.save_data_split(save_dir=model.save_dir)
+    dataset.save_data_split(save_dir=output_dir)
 
     logger.info(f"Created model with ID {model.model_id}.")
 

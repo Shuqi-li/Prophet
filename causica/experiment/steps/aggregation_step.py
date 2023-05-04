@@ -42,23 +42,23 @@ def run_aggregation_main(input_dirs: List[str], output_dir: str, summarise: bool
         logger.info("No models found")
         return
 
-    results_and_configs = [flatten_keys(get_configs_and_results(d)) for d in model_dirs]
-    df = pd.DataFrame(results_and_configs)
+    # results_and_configs = [flatten_keys(get_configs_and_results(d)) for d in model_dirs]
+    # df = pd.DataFrame(results_and_configs)
 
-    # Write all results and configs to a CSV
-    df.to_csv(
-        os.path.join(output_dir, "all_results_and_configs.csv"),
-        sep=",",
-        encoding="utf-8",
-    )
+    # # Write all results and configs to a CSV
+    # df.to_csv(
+    #     os.path.join(output_dir, "all_results_and_configs.csv"),
+    #     sep=",",
+    #     encoding="utf-8",
+    # )
 
-    if summarise:
-        if len(set(x["dataset_name"] for x in results_and_configs)) > 1:
-            # TODO summarise per dataset.
-            # Aggregation of active learning metrics will break and means, stds will be meaningless.
-            raise NotImplementedError
+    # if summarise:
+    #     if len(set(x["dataset_name"] for x in results_and_configs)) > 1:
+    #         # TODO summarise per dataset.
+    #         # Aggregation of active learning metrics will break and means, stds will be meaningless.
+    #         raise NotImplementedError
 
-        _create_summary(df, output_dir, num_samples=len(model_dirs))
+    #     _create_summary(df, output_dir, num_samples=len(model_dirs))
 
 
 def _create_summary(

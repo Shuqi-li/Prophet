@@ -15,6 +15,7 @@ from ..experiment.steps.eval_step import (
     eval_latent_confounded_causal_discovery,
     evaluate_treatment_effect_estimation,
     run_eval_main,
+    run_eval_sample,
 )
 from ..experiment.steps.step_func import load_data, preprocess_configs
 from ..experiment.steps.train_step import run_train_main
@@ -80,6 +81,7 @@ class ExperimentArguments:
     train_hypers: Dict[str, Any]
     impute_config: Dict[str, Any]
     objective_config: Dict[str, Any]
+    infer_config: Dict[str, Any]
     output_dir: str
     experiment_name: str
     model_seed: int
@@ -158,24 +160,31 @@ def run_single_seed_experiment(args: ExperimentArguments):
 
     # Imputation
     if args.run_inference:
-        if not isinstance(model, IModelForImputation):
-            raise ValueError("This model class does not support imputation.")
-        # TODO 18412: move impute_train_data flag into each dataset's imputation config rather than hardcoding here
-        impute_train_data = args.dataset_name not in {
-            "neuropathic_pain",
-            "neuropathic_pain_3",
-            "neuropathic_pain_4",
-        }
-        run_eval_main(
+        assert args.infer_config is not None
+        run_eval_sample(
             model=model,
             dataset=dataset,
-            vamp_prior_data=None,
-            impute_config=args.impute_config,
-            extra_eval=args.extra_eval,
-            split_type=args.dataset_config.get("split_type", "rows"),
+            infer_config=args.infer_config,
             seed=args.dataset_seed if isinstance(args.dataset_seed, int) else args.dataset_seed[0],
-            impute_train_data=impute_train_data,
         )
+        # if not isinstance(model, IModelForImputation):
+        #     raise ValueError("This model class does not support imputation.")
+        # # TODO 18412: move impute_train_data flag into each dataset's imputation config rather than hardcoding here
+        # impute_train_data = args.dataset_name not in {
+        #     "neuropathic_pain",
+        #     "neuropathic_pain_3",
+        #     "neuropathic_pain_4",
+        # }
+        # run_eval_main(
+        #     model=model,
+        #     dataset=dataset,
+        #     vamp_prior_data=None,
+        #     impute_config=args.impute_config,
+        #     extra_eval=args.extra_eval,
+        #     split_type=args.dataset_config.get("split_type", "rows"),
+        #     seed=args.dataset_seed if isinstance(args.dataset_seed, int) else args.dataset_seed[0],
+        #     impute_train_data=impute_train_data,
+        # )
 
     # Evaluate causal discovery
     if args.latent_confounded_causal_discovery:

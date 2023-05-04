@@ -17,6 +17,7 @@ def get_configs(
     override_impute_path: Optional[str] = None,
     override_objective_path: Optional[str] = None,
     default_configs_dir: str = "configs",
+    infer_config_path: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
     Load config files. For a given model, a set of 'global' default configs will first be loaded from
@@ -69,13 +70,18 @@ def get_configs(
     dataset_config = update_dict_from_path(dataset_config, override_dataset_path)
     impute_config = update_dict_from_path(impute_config, override_impute_path)
     objective_config = update_dict_from_path(objective_config, override_objective_path)
-
+    infer_config = None
+    if infer_config_path != None:
+        infer_config_path = os.path.join(default_configs_dir, infer_config_path)
+        infer_config = read_json_as(infer_config_path, dict)
+    
     return (
         model_config["model_hyperparams"],
         model_config["training_hyperparams"],
         dataset_config,
         impute_config,
         objective_config,
+        infer_config,
     )
 
 

@@ -32,7 +32,7 @@ def convert_dict_of_ndarray_to_lists(dict_):
 def to_tensors(
     *arrays: Union[torch.Tensor, np.ndarray], device: torch.device, dtype: torch.dtype = torch.float
 ) -> Tuple[torch.Tensor, ...]:
-    return tuple(torch.as_tensor(array, dtype=dtype, device=device) for array in arrays)
+    return tuple(torch.as_tensor(array.copy(), dtype=dtype, device=device) for array in arrays)
 
 
 @contextmanager

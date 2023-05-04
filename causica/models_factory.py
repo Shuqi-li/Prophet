@@ -37,7 +37,7 @@ from .models.point_net import PointNet, SparsePointNet
 from .models.set_encoder_base_model import SetEncoderBaseModel
 from .models.transformer_set_encoder import TransformerSetEncoder
 from .models.visl import VISL
-
+from time import localtime, strftime
 logger = logging.getLogger(__name__)
 
 MODEL_SUBCLASSES: Dict[str, Type[IModel]] = {
@@ -184,6 +184,7 @@ def create_model(
         Instance of concrete implementation of `Model` class.
     """
     # Create anything needed for all model types.
+    models_dir = os.path.join(models_dir,strftime("%Y-%m-%d_%H%M%S", localtime()))
     model_id = model_id if model_id is not None else str(uuid4())
     save_dir = os.path.join(models_dir, model_id)
     os.makedirs(save_dir)

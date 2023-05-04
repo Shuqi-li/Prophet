@@ -12,7 +12,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from ...datasets.dataset import Dataset, TemporalDataset
-from ...datasets.temporal_tensor_dataset import TemporalTensorDataset, MyTemporalTensorDataset
+from ...datasets.temporal_tensor_dataset import TemporalTensorDataset
 from ...datasets.variables import Variables
 from ...utils.causality_utils import (
     get_ate_from_samples,
@@ -21,13 +21,13 @@ from ...utils.causality_utils import (
     process_adjacency_mats,
 )
 from ...utils.helper_functions import to_tensors
-from ...utils.nri_utils import convert_temporal_to_static_adjacency_matrix, edge_prediction_metrics_multisample
+from ...utils.nri_utils import convert_temporal_to_static_adjacency_matrix
 from ..imodel import IModelForTimeseries
 from .base_distributions import TemporalConditionalSplineFlow
 from .deci import DECI
-from .generation_functions import TemporalContractiveInvertibleGNN, TemporalFGNNIwithTimesNet
+from .generation_functions import TemporalContractiveInvertibleGNN
 from .variational_distributions import AdjMatrix, TemporalThreeWayGrahpDist
-from sklearn.preprocessing import StandardScaler
+
 
 class Rhino(DECI, IModelForTimeseries):
     """
@@ -45,8 +45,6 @@ class Rhino(DECI, IModelForTimeseries):
         save_dir: str,
         device: torch.device,
         lag: int,
-        pre_len: int,
-        configs:Dict,
         allow_instantaneous: bool,
         imputation: bool = False,
         lambda_dag: float = 1.0,
@@ -115,8 +113,6 @@ class Rhino(DECI, IModelForTimeseries):
         self.conditional_decoder_layer_sizes = conditional_decoder_layer_sizes
         self.conditional_spline_order = conditional_spline_order
         self.additional_spline_flow = additional_spline_flow
-        self.configs = configs
-        
         # For V0 AR-DECI, we only support mode_adjacency="learn", so hardcoded this argument.
         super().__init__(
             model_id=model_id,
@@ -145,7 +141,6 @@ class Rhino(DECI, IModelForTimeseries):
             graph_constraint_matrix=graph_constraint_matrix,
             embedding_size=ICGNN_embedding_size,
             disable_diagonal_eval=disable_diagonal_eval,
-            pre_len=pre_len
         )
 
     def _generate_error_likelihoods(self, base_distribution_string: str, variables: Variables) -> Dict[str, nn.Module]:
@@ -195,11 +190,6 @@ class Rhino(DECI, IModelForTimeseries):
             device=self.device,
             input_dim=self.num_nodes,
             lag=self.lag,
-
-            norm_layer=self.norm_layer,
-            res_connection=self.res_connection,
-            encoder_layer_sizes=self.encoder_layer_sizes,
-
             tau_gumbel=self.tau_gumbel,
             init_logits=self.init_logits,
         )
@@ -213,25 +203,17 @@ class Rhino(DECI, IModelForTimeseries):
             An instance of the temporal ICGNN
         """
 
-        # return TemporalContractiveInvertibleGNN(
-        #     group_mask=torch.tensor(self.variables.group_mask),
-        #     lag=self.lag,
-        #     device=self.device,
-        #     norm_layer=self.norm_layer,
-        #     res_connection=self.res_connection,
-        #     encoder_layer_sizes=self.encoder_layer_sizes,
-        #     decoder_layer_sizes=self.decoder_layer_sizes,
-        #     embedding_size=self.embedding_size,
-        #     pre_len=self.pre_len
-        # )
-
-        return TemporalFGNNIwithTimesNet(
+        return TemporalContractiveInvertibleGNN(
             group_mask=torch.tensor(self.variables.group_mask),
             lag=self.lag,
-            configs= self.configs,
-            pre_len = self.pre_len
-        ).to(self.device)
-    
+            device=self.device,
+            norm_layer=self.norm_layer,
+            res_connection=self.res_connection,
+            encoder_layer_sizes=self.encoder_layer_sizes,
+            decoder_layer_sizes=self.decoder_layer_sizes,
+            embedding_size=self.embedding_size,
+        )
+
     def networkx_graph(self) -> nx.DiGraph:
         """
         This function converts the most probable graph to networkx graph. Due to the incompatibility of networkx and temporal
@@ -286,19 +268,39 @@ class Rhino(DECI, IModelForTimeseries):
         # we need to disable the diagonal elements of constraint[0, ...] rather than the entire constraint matrix in original DECI.
         # Also the original implementation only supports 2D matrix.
         if graph_constraint_matrix is None:
-            neg_constraint_matrix = np.ones((self.lag , self.num_nodes, self.num_nodes))
+            neg_constraint_matrix = np.ones((self.lag + 1, self.num_nodes, self.num_nodes))
+            if self.allow_instantaneous:
+                np.fill_diagonal(neg_constraint_matrix[0, ...], 0)
+            else:
+                neg_constraint_matrix[0, ...] = np.zeros((self.num_nodes, self.num_nodes))
             self.neg_constraint_matrix = torch.as_tensor(neg_constraint_matrix, device=self.device, dtype=torch.float32)
-            self.pos_constraint_matrix = torch.zeros((self.lag, self.num_nodes, self.num_nodes), device=self.device)
+            self.pos_constraint_matrix = torch.zeros((self.lag + 1, self.num_nodes, self.num_nodes), device=self.device)
         else:
             negative_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=1.0)
+            if not self.allow_instantaneous:
+                negative_constraint_matrix[0, ...] = np.zeros((self.num_nodes, self.num_nodes))
             self.neg_constraint_matrix = torch.as_tensor(
                 negative_constraint_matrix, device=self.device, dtype=torch.float32
             )
             # Disable diagonal elements in the instant graph constraint.
+            torch.diagonal(self.neg_constraint_matrix[0, ...]).zero_()
             positive_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=0.0)
             self.pos_constraint_matrix = torch.as_tensor(
                 positive_constraint_matrix, device=self.device, dtype=torch.float32
             )
+
+    def dagness_factor(self, A: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the DAGness loss for a temporal adjacency matrix. Since the only possible violation of DAGness is the
+        instantaneous adj A[0,...], we only need to check this dagness.
+        Args:
+            A: the temporal adjacency matrix with shape [lag+1, num_nodes, num_nodes].
+
+        Returns: A DAGness loss tensor
+        """
+        # Check shape
+        assert A.dim() == 3
+        return super().dagness_factor(A[0, ...])
 
     def _log_prob(
         self,
@@ -327,11 +329,11 @@ class Rhino(DECI, IModelForTimeseries):
 
         typed_regions = self.variables.processed_cols_by_type
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # [1, lag+pre_len, proc_dim]
+            x = x.unsqueeze(0)  # [1, lag+1, proc_dim]
         batch_size, _, proc_dim = x.shape
 
-        if predict.dim() == 2:
-            predict = predict.unsqueeze(0) #1 pre_len dim
+        if predict.dim() == 1:
+            predict = predict.unsqueeze(0)
 
         # Continuous
         cts_bin_log_prob = torch.zeros(batch_size, proc_dim).to(self.device)  # [batch, proc_dim]
@@ -341,13 +343,13 @@ class Rhino(DECI, IModelForTimeseries):
             if self.base_distribution_type == "conditional_spline":
                 assert W is not None
                 cts_bin_log_prob[..., continuous_range] = self.likelihoods["continuous"].log_prob(
-                    x[..., -self.pre_len:, continuous_range] - predict[..., continuous_range],
-                    X_history=x[..., :-self.pre_len, :],
+                    x[..., -1, continuous_range] - predict[..., continuous_range],
+                    X_history=x[..., 0:-1, :],
                     W=W,
                 )
             else:
                 cts_bin_log_prob[..., continuous_range] = self.likelihoods["continuous"].log_prob(
-                    x[..., -self.pre_len:, continuous_range] - predict[..., continuous_range]
+                    x[..., -1, continuous_range] - predict[..., continuous_range]
                 )
 
         # Binary
@@ -390,14 +392,13 @@ class Rhino(DECI, IModelForTimeseries):
         """
         typed_regions = self.variables.processed_cols_by_type
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # [1, lag+pre_len, proc_dim]
+            x = x.unsqueeze(0)  # [1, lag+1, proc_dim]
 
-        if predict.dim() == 2:
-            predict = predict.unsqueeze(0)  # batch, pre_len, prco_dim
+        if predict.dim() == 1:
+            predict = predict.unsqueeze(0)
 
         continuous_range = [i for region in typed_regions["continuous"] for i in region]
-        # return (x[..., -1, -1] - predict[..., -1]).pow(2)
-        return (x[..., -self.pre_len:, continuous_range] - predict[..., continuous_range]).pow(2).mean([-2,-1])
+        return (x[..., -1, continuous_range] - predict[..., continuous_range]).pow(2).sum(-1)
 
     def _sample_base(self, Nsamples: int, time_span: int = 1) -> torch.Tensor:
         """
@@ -436,14 +437,182 @@ class Rhino(DECI, IModelForTimeseries):
 
         return sample
 
-    #change
+    def cate(
+        self,
+        intervention_idxs: Union[torch.Tensor, np.ndarray],
+        intervention_values: Union[torch.Tensor, np.ndarray],
+        reference_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        effect_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        conditioning_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        conditioning_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        Nsamples_per_graph: int = 5,
+        Ngraphs: int = 200,
+        most_likely_graph: bool = False,
+        fixed_seed: Optional[int] = None,
+        conditioning_history: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        This method implements the CATE for AR-DECI. For the first version of CATE, we assume the following:
+        (1) We have a fully observed conditioning history sample; (2) No conditioning is allowed for current or future time
+        steps. With these assumptions, one can compute the CATE by auto-regressively generating effect variables in future time with intervened
+        graphs and conditioned history. Thing will be a bit trickier if current or future conditioning is allowed (addressed by future version of cate).
+        Args:
+            intervention_idxs: ndarray or Tensor with shape [num_interventions, 2], where intervention_idxs[...,0] stores the index of the intervention variable
+                and intervention_idxs[...,1] stores the ahead time of that intervention. E.g. intervention_idxs[0] = [4,0] means the intervention variable idx is 4
+                at current time t.
+            intervention_values: ndarray or Tensor with shape [proc_dim] (proc_dim depends on num_interventions) storing the intervention values corresponding to intervention_idxs
+            reference_values: Same as intervention_values, but for reference.
+            effect_idxs: ndarray or Tensor with shape [num_effects, 2], where effect_idxs[...,0] stores the index of the effect variable
+                and effect_idxs[...,1] stores the ahead time of that effect. E.g. effect_idxs[0] = [2,1] means the effect variable idx is 2 at time t+1.
+            conditioning_idxs: It has the same shape as intervention_idxs. For the first version, it has to be None.
+            conditioning_values: It has the same shape as intervention_values. For the first version, it has to be None.
+            Nsamples_per_graph: The number of observation samples for each graph.
+            Ngraphs: Number of different graphs to sample for graph posterior marginalisation.
+            most_likely_graph: bool indicatng whether to deterministically pick the most probable graph under the
+                approximate posterior or to draw a new graph for every sample
+            fixed_seed: The integer to seed the random number generator (unused)
+            conditioning_history: ndarray or Tensor with shape [history_length, num_processed_variables] storing the conditioning history sample.
+                Should not be None since the AR-DECI does not have source node model and it cannot contain nans.
+
+        Returns:
+            CATE: ndarray with shape [num_effects] or [time_span, proc_dim] (if unspecified effect_idxs)
+            CATE_norm: ndarray, normalzied CATE with shape [num_effects] or [time_span, proc_dim] (if unspecified effect_idxs)
+
+        """
+        # Assertion to make sure conditioning_history is not None, cannot contain nans, at least has length >= model.lag and only 2D
+        if conditioning_history is None:
+            raise ValueError("Current AR-DECI requires conditioned history to sample future observations.")
+
+        mod_ = np if isinstance(conditioning_history, np.ndarray) else torch
+        if mod_.any(mod_.isnan(conditioning_history)):
+            raise ValueError("Conditoning history cannot contain nans.")
+
+        assert (
+            conditioning_history.ndim if isinstance(conditioning_history, np.ndarray) else conditioning_history.dim()
+        ) == 2, f"Conditioning_history should be 2D matrix with shape [history_length, num_processed_variables] but got {conditioning_history.shape}"
+        assert (
+            conditioning_history.shape[0] >= self.lag
+        ), "Current AR-DECI requires conditioned history to sample future observations."
+
+        # Assertion for other arguments and currently conditioning_idxs, and conditioning_values must be None for first version CATE
+        assert Nsamples_per_graph > 1, "The number of samples per graph must be greater than 1"
+        assert (
+            conditioning_idxs is None and conditioning_values is None
+        ), "For first version of CATE, conditioning_idxs and conditioning_values should be None"
+
+        Nsamples = Ngraphs * Nsamples_per_graph
+
+        # Determine the time_span
+        if effect_idxs is not None:
+            time_span = max(max(intervention_idxs[:, 1]), max(effect_idxs[:, 1])).item() + 1
+        else:
+            time_span = max(intervention_idxs[:, 1]).item() + 1
+
+        with torch.no_grad():
+            # Sample reference samples using self.sample
+            if reference_values is not None:
+                reference_samples = (
+                    self.sample(
+                        Nsamples=Nsamples,
+                        most_likely_graph=most_likely_graph,
+                        intervention_idxs=intervention_idxs,
+                        intervention_values=reference_values,
+                        samples_per_graph=Nsamples_per_graph,
+                        X_history=conditioning_history,
+                        time_span=time_span,
+                    )
+                    .squeeze(0)
+                    .detach()
+                )
+            else:
+                reference_samples = (
+                    self.sample(
+                        Nsamples=Nsamples,
+                        most_likely_graph=most_likely_graph,
+                        samples_per_graph=Nsamples_per_graph,
+                        X_history=conditioning_history,
+                        time_span=time_span,
+                    )
+                    .squeeze(0)
+                    .detach()
+                )  # [Nsamples, time_span, proc_dim]
+            # Sample intervened samples using self.sample
+            model_intervention_samples = (
+                self.sample(
+                    Nsamples=Nsamples,
+                    most_likely_graph=most_likely_graph,
+                    intervention_idxs=intervention_idxs,
+                    intervention_values=intervention_values,
+                    samples_per_graph=Nsamples_per_graph,
+                    X_history=conditioning_history,
+                    time_span=time_span,
+                )
+                .squeeze(0)
+                .detach()
+            )  # [Nsamples, time_span, proc_dim]
+
+            # Compute CATE and norm_CATE by using get_ate_from_samples()
+            model_history_cate = get_ate_from_samples(
+                model_intervention_samples.cpu().numpy().astype(np.float64),
+                reference_samples.cpu().numpy().astype(np.float64),
+                self.variables,
+                normalise=False,
+                processed=True,
+            )  # shape [time_span, proc_dim]
+            model_history_norm_cate = get_ate_from_samples(
+                model_intervention_samples.cpu().numpy().astype(np.float64),
+                reference_samples.cpu().numpy().astype(np.float64),
+                self.variables,
+                normalise=True,
+                processed=True,
+            )  # shape [time_span, proc_dim]
+
+        # Extract the CATE for effect variables
+        if effect_idxs is not None:
+            effect_idxs = to_tensors(effect_idxs, device="cpu", dtype=torch.long)[0]
+            _, effect_mask, _ = get_mask_and_value_from_temporal_idxs(
+                intervention_idxs=effect_idxs,
+                intervention_values=None,
+                group_mask=self.variables.group_mask,
+                device="cpu",
+            )  # shape [time_span_effect, proc_dim]
+            # make shape compatible
+            concat_mask = torch.full(
+                (time_span - torch.max(effect_idxs[:, 1]) - 1, effect_mask.shape[-1]),
+                False,
+                dtype=torch.bool,
+                device="cpu",
+            )
+            effect_mask = torch.cat((effect_mask, concat_mask), dim=0)  # [time_span, proc_dim]
+            model_history_cate, model_history_norm_cate = (
+                model_history_cate[effect_mask.numpy()],
+                model_history_norm_cate[effect_mask.numpy()],
+            )
+
+        return model_history_cate, model_history_norm_cate
+
+    def ite(
+        self,
+        X: Union[torch.Tensor, np.ndarray],
+        intervention_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        intervention_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        reference_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        Ngraphs: int = 100,
+        most_likely_graph: bool = False,
+    ) -> np.ndarray:
+        """
+        For V0, we focus on causal discovery, so NotImplementedError for now.
+        """
+        raise NotImplementedError
+
     def sample(  # type:ignore
         self,
         Nsamples: int = 100,
         most_likely_graph: bool = False,
         intervention_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
         intervention_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        samples_per_graph_groups: int = 1,
+        samples_per_graph: int = 1,
+        max_batch_size: int = 1024,
         X_history: Optional[Union[torch.Tensor, np.ndarray]] = None,
         time_span: int = 1,
     ) -> torch.Tensor:
@@ -468,12 +637,12 @@ class Rhino(DECI, IModelForTimeseries):
         """
         assert X_history is not None, "For V0 AR-DECI, empty history generation is not supported"
         # Assertions for Nsamples must be multiple of samples_per_graph.
-        # if most_likely_graph:
-        #     assert Nsamples == samples_per_graph_groups
-        # else:
-        assert (
-                Nsamples % samples_per_graph_groups == 0
-            ), f"Nsamples ({Nsamples}) must be multiples of samples_per_graph ({samples_per_graph_groups})"
+        if most_likely_graph:
+            assert Nsamples == samples_per_graph
+        else:
+            assert (
+                Nsamples % samples_per_graph == 0
+            ), f"Nsamples ({Nsamples}) must be multiples of samples_per_graph ({samples_per_graph})"
         # convert X_history to torch.Tensor
         if isinstance(X_history, np.ndarray):
             X_history = to_tensors(X_history, device=self.device, dtype=torch.float)[0]
@@ -509,102 +678,107 @@ class Rhino(DECI, IModelForTimeseries):
         gt_zero_region = [j for i in self.variables.processed_cols_by_type["binary"] for j in i]
 
         with torch.no_grad():
-            if most_likely_graph:
-                num_graph_samples = 1
-                samples_per_graph_groups = Nsamples
+            num_graph_samples = Nsamples // samples_per_graph
+            W_adj_samples = self.get_weighted_adj_matrix(
+                do_round=most_likely_graph,
+                samples=num_graph_samples,
+                most_likely_graph=most_likely_graph,
+            )  # shape [num_graph_sample, lag+1, num_node, num_node]
+            if self.base_distribution_type == "conditional_spline":
+                # Noise cannot be sampled outside the simulate_SEM due to history dependence.
+                # Need call self.ICGNN.simulate_SEM_conditional(...)
+                # Get conditional distribution
+                conditional_dist = self.likelihoods["continuous"]
+                # Iterate over graph samples
+                X = []
+                for W_adj in W_adj_samples:
+                    # sample base noise, and repeat history
+                    X_history_rep = X_history.repeat(
+                        [samples_per_graph, 1, 1]
+                    )  # [N_history_batch*samples_per_graph, hist_len, proc_dim]
+                    Z = self._sample_base(
+                        samples_per_graph * N_history_batch, time_span=time_span
+                    )  # [batch*samples_per_graph, time_span, proc_dim]
+
+                    for Z_batch, X_history_batch in zip(
+                        torch.split(Z, max_batch_size, dim=0),
+                        torch.split(X_history_rep, max_batch_size, dim=0),
+                    ):
+                        X.append(
+                            self.ICGNN.simulate_SEM_conditional(
+                                conditional_dist=conditional_dist,
+                                Z=Z_batch,
+                                W_adj=W_adj,
+                                X_history=X_history_batch,
+                                gumbel_max_regions=gumbel_max_regions,
+                                gt_zero_region=gt_zero_region,
+                                intervention_mask=intervention_mask,
+                                intervention_values=intervention_values,
+                            )[1].detach()
+                        )  # shape [batch*samples_per_graph, time_span, proc_dim]
+
+                samples = (
+                    torch.cat(X, dim=0).view(Nsamples, N_history_batch, time_span, proc_dim).transpose(0, 1)
+                )  # shape [N_history_batch, Nsamples, time_span, proc_dim]
+
             else:
-                num_graph_samples = Nsamples // samples_per_graph_groups
-     
 
-            Z = self._sample_base(
-                    samples_per_graph_groups * N_history_batch, time_span=time_span
-                ) # [batch*samples_per_graph, time_span, proc_dim]
+                # Sample weighted graph from posterior with shape [num_graph_samples, lag+1, num_nodes, num_nodes]
+                # Repeat to shape [N_samples*N_history_batch, lag+1, node, node]
+                if most_likely_graph:
+                    W_adj_samples = W_adj_samples.expand(
+                        Nsamples * N_history_batch, -1, -1, -1
+                    )  # shape [Nsamples*N_history_batch, lag+1, node, node]
+                else:
+                    W_adj_samples = torch.repeat_interleave(
+                        W_adj_samples, repeats=int(samples_per_graph), dim=0
+                    ).repeat(
+                        N_history_batch, 1, 1, 1
+                    )  # [Nsamples*N_history_batch, lag+1, node, node]
 
-
-            
-            X_simulate_total = []
-            #X_history  shape [batch, history_length, proc_dims]
-            # Iterate over graph samples
-            if intervention_mask is not None and intervention_values is not None:
-                assert (
-                    time_span >= intervention_mask.shape[0]
-                ), "The future ahead time for observation generation must be >= the ahead time for intervention"
-                # Convert the time_length in intervention mask to be compatible with X_all
-                false_matrix_conditioning = torch.full(X_history.shape[1:], False, dtype=torch.bool, device=self.device)
-                false_matrix_future = torch.full(
-                    (Z.shape[1] - intervention_mask.shape[0], Z.shape[2]), False, dtype=torch.bool, device=self.device
-                )
-                intervention_mask = torch.cat(
-                    (false_matrix_conditioning, intervention_mask, false_matrix_future), dim=0
-                )  # shape [history_length+ time_span, processed_dim_all]
-
-            for num in range(num_graph_samples):
-                W_adj = self.get_weighted_adj_matrix(
-                    x_history=X_history[:, -self.lag:],
-                    do_round=most_likely_graph,
-                    samples=1,
-                    most_likely_graph=most_likely_graph,
-                ).view(-1, self.lag, proc_dim, proc_dim)  #[batch, lag, nodes, nodes]
-
-
-                # Generate the observations based on the history (given history + previously-generated observations)
-                # and exogenous noise Z.
-                predict = self.ICGNN.f.feed_forward(X_history[:, -self.lag:], W_adj=W_adj).transpose(-1, -2) #batch, time_span nodes
-    
-                X_simulate_total.append(predict) #samples_per_graph*batch, time_span pro_dim
-
-    
-            predict_f = (
-                torch.cat(X_simulate_total, dim=0).view(-1, N_history_batch, time_span, proc_dim)
-            )  # shape [num_graph_samples, N_history_batch, time_span, proc_dim]
-            samples = predict_f
-            # samples = (predict_f.unsqueeze(0) + Z.view(-1, N_history_batch, time_span, proc_dim).unsqueeze(1)).view(-1, N_history_batch, time_span, proc_dim)
-            # else:
-
-            #     # Sample weighted graph from posterior with shape [num_graph_samples, lag+1, num_nodes, num_nodes]
-            #     # Repeat to shape [N_samples*N_history_batch, lag+1, node, node]
-            #     if most_likely_graph:
-            #         W_adj_samples = W_adj_samples.expand(
-            #             Nsamples * N_history_batch, -1, -1, -1
-            #         )  # shape [Nsamples*N_history_batch, lag+1, node, node]
-            #     else:
-            #         W_adj_samples = torch.repeat_interleave(
-            #             W_adj_samples, repeats=int(samples_per_graph), dim=0
-            #         ).repeat(
-            #             N_history_batch, 1, 1, 1
-            #         )  # [Nsamples*N_history_batch, lag+1, node, node]
-
-            #     # repeat X_history to shape [N_history_batch*N_sample, hist_length, proc_dim]
-            #     X_history_rep = torch.repeat_interleave(
-            #         X_history, repeats=Nsamples, dim=0
-            #     )  # [N_history_batch*Nsamples, hist_len, proc_dim]
-            #     # Sample noise from base distribution with shape [N_history_batch*Nsamples, time_span, proc_dims]
-            #     Z = self._sample_base(Nsamples * N_history_batch, time_span=time_span)
-            #     X = []
-            #     for W_adj_batch, Z_batch, X_history_batch in zip(
-            #         torch.split(W_adj_samples, max_batch_size, dim=0),
-            #         torch.split(Z, max_batch_size, dim=0),
-            #         torch.split(X_history_rep, max_batch_size, dim=0),
-            #     ):
-            #         # W_adj_batch, Z_batch have shape [max_batch, lag+1, node, node] and [max_batch, time_span, proc_dim]
-            #         X.append(
-            #             self.ICGNN.simulate_SEM(
-            #                 Z_batch,
-            #                 W_adj_batch,
-            #                 X_history_batch,
-            #                 gumbel_max_regions,
-            #                 gt_zero_region,
-            #                 intervention_mask=intervention_mask,
-            #                 intervention_values=intervention_values,
-            #             )[
-            #                 1
-            #             ].detach()  # shape[max_batch, time_span, proc_dim]
-            #         )
-            #     samples = torch.cat(X, dim=0).view(
-            #         N_history_batch, Nsamples, time_span, proc_dim
-            #     )  # shape [N_history_batch, Nsamples, time_span, proc_dim]
+                # repeat X_history to shape [N_history_batch*N_sample, hist_length, proc_dim]
+                X_history_rep = torch.repeat_interleave(
+                    X_history, repeats=Nsamples, dim=0
+                )  # [N_history_batch*Nsamples, hist_len, proc_dim]
+                # Sample noise from base distribution with shape [N_history_batch*Nsamples, time_span, proc_dims]
+                Z = self._sample_base(Nsamples * N_history_batch, time_span=time_span)
+                X = []
+                for W_adj_batch, Z_batch, X_history_batch in zip(
+                    torch.split(W_adj_samples, max_batch_size, dim=0),
+                    torch.split(Z, max_batch_size, dim=0),
+                    torch.split(X_history_rep, max_batch_size, dim=0),
+                ):
+                    # W_adj_batch, Z_batch have shape [max_batch, lag+1, node, node] and [max_batch, time_span, proc_dim]
+                    X.append(
+                        self.ICGNN.simulate_SEM(
+                            Z_batch,
+                            W_adj_batch,
+                            X_history_batch,
+                            gumbel_max_regions,
+                            gt_zero_region,
+                            intervention_mask=intervention_mask,
+                            intervention_values=intervention_values,
+                        )[
+                            1
+                        ].detach()  # shape[max_batch, time_span, proc_dim]
+                    )
+                samples = torch.cat(X, dim=0).view(
+                    N_history_batch, Nsamples, time_span, proc_dim
+                )  # shape [N_history_batch, Nsamples, time_span, proc_dim]
 
         return samples
+
+    def _counterfactual(
+        self,
+        X: torch.Tensor,
+        W_adj: torch.Tensor,
+        intervention_idxs: Union[torch.Tensor, np.ndarray] = None,
+        intervention_values: Union[torch.Tensor, np.ndarray] = None,
+    ) -> torch.Tensor:
+        """
+        For V0, it does not support counterfactual. NotImplementedError for now.
+        """
+        raise NotImplementedError
 
     def log_prob(
         self,
@@ -705,77 +879,17 @@ class Rhino(DECI, IModelForTimeseries):
             dataloader: A dataloader that supports loading temporal data with shape [N_batch, lag+1, proc_dims].
             num_samples: The size of the training data set.
         """
-
         # The implementation is identical to the one in FT-DECI but with is_autoregressive=True.
         data, mask = self.process_dataset(dataset, train_config_dict)
-        scaler = StandardScaler()
-        scaler.fit(data)
-        data = scaler.transform(data)
-        # data, mask = dataset.train_data_and_mask
-     
         tensor_dataset = TemporalTensorDataset(
-                *to_tensors(data, mask, device=self.device),
-                lag=self.lag + self.pre_len-1,
-                is_autoregressive=True,
-                index_segmentation=dataset.train_segmentation,
-            )
-        
-            
+            *to_tensors(data, mask, device=self.device),
+            lag=self.lag,
+            is_autoregressive=True,
+            index_segmentation=dataset.train_segmentation,
+        )
         dataloader = DataLoader(tensor_dataset, batch_size=train_config_dict["batch_size"], shuffle=True)
 
         return dataloader, len(tensor_dataset)
-
-    def my_data_loader(self, data, batch_size, index_segmentation,time_span):
-        tensor_dataset = MyTemporalTensorDataset(
-            *to_tensors(data, device=self.device),
-            lag=self.lag,
-            is_autoregressive=True,
-            index_segmentation=index_segmentation,
-            time_span=time_span,
-        )
-        dataloader = DataLoader(tensor_dataset, batch_size=batch_size, shuffle=False)
-        return dataloader
-
-    #change
-    def _create_dataset_for_sample(
-        self, dataset: TemporalDataset, infer_config_dict: Dict[str, Any]
-    ) -> Tuple[DataLoader, int]:
-        """
-        This creates a dataloader for AR-DECI to load temporal tensors. It also returns the size of the training data.
-
-        Args:
-            dataset: the training dataset.
-            train_config_dict: the training config dict.
-
-        Returns:
-            dataloader: A dataloader that supports loading temporal data with shape [N_batch, lag+1, proc_dims].
-            num_samples: The size of the training data set.
-        """
-        # The implementation is identical to the one in FT-DECI but with is_autoregressive=True.
-        dataloader = {
-            'val':{},
-            'test':{}
-        }
-        batch_size = infer_config_dict['batch_size']
-        time_span = infer_config_dict['time_span']
-        processed_dataset = self.data_processor.process_dataset(dataset)
-        train_data, _ = processed_dataset.train_data_and_mask
-        scaler = StandardScaler()
-        scaler.fit(train_data)
-        val_data, _ = processed_dataset.val_data_and_mask
-        val_data = scaler.transform(val_data)
-        test_data, _ = processed_dataset.test_data_and_mask
-        test_data = scaler.transform(test_data)
-        # dataloader['train']['data_len'] = len(train_data)
-        # dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation, time_span)
-        
-        if val_data is not None:
-            dataloader['val']['data_len'] = len(val_data)
-            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation, time_span)
-        if test_data is not None:
-            dataloader['test']['data_len'] = len(test_data)
-            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation, time_span)
-        return dataloader
 
     def set_prior_A(
         self,
@@ -883,289 +997,9 @@ class Rhino(DECI, IModelForTimeseries):
             train_config_dict=train_config_dict,
             report_progress_callback=report_progress_callback,
         )
-
-    def run_inference(self, dataset, infer_config_dict):
-        dataloader = self._create_dataset_for_sample(dataset, infer_config_dict)
-        total_metric={
-            'train':{},
-            'val':{},
-            'test':{}
-        }
-
-        for k, item in dataloader.items():
-            total_metric[k]['data_num'] = item['data_len']
-            metric={}
-            mse_sample = None
-            # acc_sample = None
-            # acc_mask = None
-            # target_all = None
-            # predicts_all = None
-            for x_, target_ in item['loader']:
-                x=x_[0] #batch lag nodes
-                pre_value = x[:,-1].clone() #batch node
-                # #normalize
-                # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
-                # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
-                # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
-                # x = (x - x_mean)/x_std
-
-                target=target_[0] # batch time_span nodes
-                predicts = self.sample(X_history=x,
-                                    Nsamples=infer_config_dict['Nsamples'],
-                                    most_likely_graph=infer_config_dict['most_likely_graph'],
-                                    intervention_idxs=infer_config_dict['intervention_idxs'],
-                                    intervention_values=infer_config_dict['intervention_values'],
-                                    samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'],
-                                    time_span = infer_config_dict['time_span'])
-                
-                mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
-
-                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
-    
-                # target_all = torch.cat([target_all,target], dim = 0) if target_all != None else target
-                # predicts_all = torch.cat([predicts_all,predicts], dim = 1) if predicts_all != None else predicts
-
-            # for i, normalizer in enumerate(self.data_processor._cts_normalizers):
-            #     target_all[..., i] = normalizer.inverse_transform(target_all[[..., i]])
-            #     predicts_all[..., i] = normalizer.inverse_transform(predicts_all[..., i])
-            
-           
-
-                # renormalize
-                # predicts = self.scaler.inverse_transform(predicts)
- 
-
-                # mse_sample_ = (target-predicts).pow(2)
-                # mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
-
-                # if infer_config_dict['movement'] == True:
-                #     move = target[:, 0]-pre_value
-                #     move_target = torch.where(move>=0, 1, 0)
-                #     acc_mask_ = ~(torch.where(move/pre_value<0.0055, 1, 0) * torch.where(move/pre_value>-0.005, 1, 0)) 
-
-                #     predict_move = predicts[:,:,0]-pre_value  #sample batch nodes
-                #     move_predict  = torch.where(predict_move>=0, 1, 0) #sample batch nodes
-                #     acc_sample_ = (move_target == move_predict).float()
-                #     acc_sample = torch.cat([acc_sample,acc_sample_], dim=1) if acc_sample!=None else acc_sample_
-                #     acc_mask = torch.cat([acc_mask,acc_mask_], dim=0) if acc_mask!=None else acc_mask_
-
-            # metric['rmse'] = torch.sqrt(mse_sample.mean([1,2,3])).mean(0).tolist()
-
-
-            # # 每个节点的mse均值和采样方差
-            # metric['rmse_pre_node'] =torch.sqrt(mse_sample).mean(0).tolist()
-            # metric['rmse_var_pre_node'] =torch.sqrt(mse_sample).var(0).tolist()
-
-            # samples batch nodes
-            metric['mse_mean_pre_node'] = mse_sample.mean(1).mean(0).tolist()
-            # metric['mse_var_pre_node'] = mse_sample.mean(1).var(0).tolist()
-            # 所有节点的mse均值和采样方差
-            metric['mse_mean'] = mse_sample.mean([1,2]).mean(0).tolist()
-            # metric['mse_var'] = mse_sample.mean([1,2]).var(0).tolist()
-           
-            # if infer_config_dict['movement'] == True:
-            #     acc_mask[...] =1
-            #     acc_sample = acc_sample * acc_mask # sample, batch, nodes
-            #     # acc_mask (batch nodes)
-            #     # acc_sample = acc_sample.mean(1)
-            #     metric['acc_mean_per_node'] = (acc_sample.sum(1)/acc_mask.sum(0)).mean(0).tolist()
-            #     metric['acc_var_per_node'] =(acc_sample.sum(1)/acc_mask.sum(0)).var(0).tolist()
-            #     metric['acc_mean'] = (acc_sample.sum([1,2])/acc_mask.sum()).mean(0).tolist()
-            #     metric['acc_var'] = (acc_sample.sum([1,2])/acc_mask.sum()).var(0).tolist()
-            
-            total_metric[k]['metric']=metric
-
-                    
-
-
-        return total_metric
-
-
-
-    def get_adj_matrix_tensor(
-        self, x_history, do_round: bool = True, samples: int = 100, most_likely_graph: bool = False
-    ) -> torch.Tensor:
-        if self.mode_adjacency == "learn":
-            if most_likely_graph:
-                assert samples == 1, "When passing most_likely_graph, only 1 sample can be returned."
-                A_samples = [self.var_dist_A.get_adj_matrix(x_history, do_round=do_round)]
-            else:
-                A_samples = [self.var_dist_A.sample_A(x_history) for _ in range(samples)]
-                if do_round:
-                    A_samples = [A.round() for A in A_samples]
-            adj = torch.stack(A_samples, dim=0)
-        elif self.mode_adjacency == "upper":
-            adj = (
-                torch.triu(torch.ones(self.num_nodes, self.num_nodes), diagonal=1)
-                .to(self.device)
-                .expand(samples, -1, -1)
-            )
-        elif self.mode_adjacency == "lower":
-            adj = (
-                torch.tril(torch.ones(self.num_nodes, self.num_nodes), diagonal=-1)
-                .to(self.device)
-                .expand(samples, -1, -1)
-            )
-        else:
-            raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
-        return self._apply_constraints(adj)
-
-
-    def get_adj_matrix(
-        self,
-        x_history,
-        do_round: bool = True,
-        samples: int = 100,
-        most_likely_graph: bool = False,
-        squeeze: bool = False,
-    ) -> np.ndarray:
-        """
-        Returns the adjacency matrix (or several) as a numpy array.
-        """
-        adj_matrix = self.get_adj_matrix_tensor(x_history, do_round, samples, most_likely_graph)
-
-        if squeeze and samples == 1:
-            adj_matrix = adj_matrix.squeeze(0)
-        # Here we have the cast to np.float64 because the original type
-        # np.float32 has some issues with json, when saving causality results
-        # to a file.
-        return adj_matrix.detach().cpu().numpy().astype(np.float64)
-
-
-    def get_weighted_adj_matrix(
-        self,
-        x_history, 
-        do_round: bool = True,
-        samples: int = 100,
-        most_likely_graph: bool = False,
-        squeeze: bool = False,
-    ) -> torch.Tensor:
-        """
-        Returns the weighted adjacency matrix (or several) as a numpy array.
-        """
-        A_samples = self.get_adj_matrix_tensor(x_history, do_round, samples, most_likely_graph)
-
-        W_adjs = A_samples * self.ICGNN.get_weighted_adjacency().unsqueeze(0)
-
-        if squeeze and samples == 1:
-            W_adjs = W_adjs.squeeze(0)
-
-        return W_adjs
-    
-
-    def _ELBO_terms(self, X: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Computes all terms involved in the ELBO.
-
-        Args:
-            X: Batched samples from the dataset, size (batch_size, lag+1, input_dim).
-
-        Returns:
-            Dict[key, torch.Tensor] containing all the terms involved in the ELBO.
-        """
-        # Get adjacency matrix with weights
-
-
-        x_history = X[:, :-self.pre_len]
-
-        A_sample = self.get_adj_matrix_tensor(x_history=x_history, do_round=False, samples=1, most_likely_graph=False).squeeze(0)
-        #[batch, lag, nodes, nodes]
-        if self.mode_adjacency == "learn":
-            factor_q = 1.0
-        elif self.mode_adjacency in ["upper", "lower"]:
-            factor_q = 0.0
-        else:
-            raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
- 
-        W_adj = A_sample * self.ICGNN.get_weighted_adjacency()  #[batch, lag, nodes, nodes]
-        predict = self.ICGNN.predict(x_history, W_adj).transpose(-1,-2)  # batch pre_len nodes
-        log_p_A = self._log_prior_A(A_sample)  # A number
-
-        
-        log_p_base = self._log_prob(
-                X,
-                predict,
-                W=A_sample if self.base_distribution_type == "conditional_spline" else None,
-            )  # (B)
-
-            # self.ICGNN.predict(X, W_adj)
-        log_q_A = self.var_dist_A.entropy()  # A number
-        
-
-        # renormalize
-
-        cts_mse = self._icgnn_cts_mse(X, predict)  # (B)
-
-        return {
-            "log_p_A": log_p_A,
-            "log_p_base": log_p_base,
-            "log_q_A": log_q_A * factor_q,
-            "cts_mse": cts_mse,
-        }
-
-
-    def compute_loss(
-        self,
-        step: int,
-        x: torch.Tensor,
-        mask_train_batch: torch.Tensor,
-        input_mask: torch.Tensor,
-        num_samples: int,
-        tracker: Dict,
-        train_config_dict: Dict[str, Any],
-        alpha: float = None,
-        rho: float = None,
-        adj_true: Optional[np.ndarray] = None,
-        compute_cd_fscore: bool = False,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Dict]:
-        """Computes the loss and updates trackers of different terms.
-
-        Args:
-            step: Inner auglag step.
-            x: Input data of shape (batch_size, input_dim).
-            mask_train_batch: Mask indicating which values are missing in the dataset of shape (batch_size, input_dim).
-            input_mask: Mask indicating which additional values are aritificially masked.
-            num_samples: Number of samples used to compute a stochastic estimate of the loss.
-            tracker: Tracks terms in the loss during the inner auglag optimisation.
-            train_config_dict: Contains training configuration.
-            alpha: Parameter used to scale the penalty_dag term in the prior. Defaults to None.
-            rho: Parameter used to scale the penalty_dag term in the prior. Defaults to None.
-            adj_true: ground truth adj matrix for tracking causal discovery performance in inner loops
-            compute_cd_fscore: whether to compute `cd_fscore` metric at each step. Warning: this may have negative
-                side-effects on speeed and GPU utilization.
-
-        Returns:
-            Tuple containing the loss and the tracker.
-        """
-        _ = kwargs
-
-
-        #  Compute remaining terms
-        elbo_terms = self._ELBO_terms(x)
-        log_p_term = elbo_terms["log_p_base"].mean(dim=0)
-        log_p_A_term = elbo_terms["log_p_A"] / num_samples
-        log_q_A_term = elbo_terms["log_q_A"] / num_samples
-        cts_mse = elbo_terms["cts_mse"].mean(dim=0)
-        cts_medse, _ = torch.median(elbo_terms["cts_mse"], dim=0)
-
-
-        if train_config_dict["anneal_entropy"] == "linear":
-            ELBO = log_p_term  - log_q_A_term / max(step - 5, 1) #-  log_p_A_term
-        elif train_config_dict["anneal_entropy"] == "noanneal":
-            ELBO = log_p_term  - log_q_A_term #- log_p_A_term
-        loss = -ELBO
-
-
-        tracker["loss"].append(loss.item())
-        
-        # loss = loss +  cts_mse
-
-        tracker["log_p_A_sparse"].append(log_p_A_term.item())
-        tracker["log_p_x"].append(log_p_term.item())
-        tracker["log_q_A"].append(log_q_A_term.item())
-        tracker["cts_mse_icgnn"].append(cts_mse.item())
-        tracker["cts_medse_icgnn"].append(cts_medse.item())
-        return loss, tracker
-
-
+        # Save the sampled adjacency matrix
+        sampled_probable_adjacency = self.get_adj_matrix(do_round=True, samples=1, most_likely_graph=True, squeeze=True)
+        np.save(
+            os.path.join(self.save_dir, self._saved_most_likely_adjacency_file),
+            sampled_probable_adjacency,
+        )

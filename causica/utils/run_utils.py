@@ -1,6 +1,6 @@
 import os
 from glob import glob
-from time import gmtime, strftime
+# from time import localtime, strftime
 from typing import List, Optional, Tuple
 
 
@@ -43,9 +43,9 @@ def find_all_model_dirs(parent_dirs: List[str], model_file_name: str = "model.pt
 
 
 def create_models_dir(output_dir: str, name: Optional[str] = None) -> str:
-    dir_name = strftime("%Y-%m-%d_%H%M%S", gmtime())
+    # dir_name = strftime("%Y-%m-%d_%H%M%S", localtime())
     if name:
-        dir_name = f"{name}_{dir_name}"
-    models_dir = os.path.join(output_dir, dir_name, "models")
-    os.makedirs(models_dir)
+        # dir_name = f"{name}_{dir_name}"
+        models_dir = os.path.join(output_dir, name)
+    os.makedirs(models_dir, exist_ok=True)
     return models_dir

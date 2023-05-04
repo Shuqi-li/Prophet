@@ -20,6 +20,8 @@ To see information about other options, run this script with -h.
 import argparse
 import os
 import sys
+
+
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +72,7 @@ def run_experiment(
     dataset_config_path: Optional[str] = None,
     impute_config_path: Optional[str] = None,
     objective_config_path: Optional[str] = None,
+    infer_config_path: Optional[str] = None,
     run_inference: bool = False,
     extra_eval: bool = False,
     active_learning: Optional[List[str]] = None,
@@ -97,7 +100,7 @@ def run_experiment(
     if active_learning_users_to_plot is None:
         active_learning_users_to_plot = []
     # Load configs
-    model_config, train_hypers, dataset_config, impute_config, objective_config = get_configs(
+    model_config, train_hypers, dataset_config, impute_config, objective_config, infer_config = get_configs(
         model_type=model_type,
         dataset_name=dataset_name,
         override_dataset_path=dataset_config_path,
@@ -105,6 +108,7 @@ def run_experiment(
         override_impute_path=impute_config_path,
         override_objective_path=objective_config_path,
         default_configs_dir=default_configs_dir,
+        infer_config_path=infer_config_path,
     )
     if random_seed is not None:
         model_config["random_seed"] = random_seed
@@ -128,6 +132,7 @@ def run_experiment(
         "dataset_config_path": dataset_config_path,
         "impute_config_path": impute_config_path,
         "objective_config_path": objective_config_path,
+        "infer_config_path": infer_config_path,
         "run_inference": run_inference,
         "active_learning": active_learning,
         "causal_discovery": causal_discovery,
@@ -140,6 +145,7 @@ def run_experiment(
         "train_hypers": train_hypers,
         "impute_config": impute_config,
         "objective_config": objective_config,
+        "infer_config":infer_config,
     }
     mlflow.set_tags(aml_tags)
 
@@ -179,6 +185,7 @@ def run_experiment(
             train_hypers=train_hypers,
             impute_config=impute_config,
             objective_config=objective_config,
+            infer_config=infer_config,
             output_dir=models_dir,
             experiment_name=experiment_name,
             model_seed=model_seed,
@@ -262,6 +269,7 @@ def run_experiment_on_parsed_args(args: argparse.Namespace, run_context: RunCont
             dataset_config_path=args.dataset_config,
             impute_config_path=args.impute_config,
             objective_config_path=args.objective_config,
+            infer_config_path=args.infer_config,
             run_inference=args.run_inference,
             extra_eval=args.extra_eval,
             active_learning=args.active_learning,
@@ -272,7 +280,7 @@ def run_experiment_on_parsed_args(args: argparse.Namespace, run_context: RunCont
             treatment_effects=args.treatment_effects,
             output_dir=args.output_dir,
             device=args.device,
-            name=args.name,
+            name=experiment_name,
             quiet=False,
             active_learning_users_to_plot=args.users_to_plot,
             tiny=args.tiny,
@@ -297,4 +305,5 @@ def main(user_args):
 
 
 if __name__ == "__main__":
+
     main(sys.argv[1:])

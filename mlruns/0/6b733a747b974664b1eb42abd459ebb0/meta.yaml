@@ -1,0 +1,15 @@
+artifact_uri: file:///data/shuqili/nni_causica/mlruns/0/6b733a747b974664b1eb42abd459ebb0/artifacts
+end_time: 1683419232333
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 6b733a747b974664b1eb42abd459ebb0
+run_name: electricity.rhino_informer
+run_uuid: 6b733a747b974664b1eb42abd459ebb0
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1683419211542
+status: 4
+tags: []
+user_id: shuqili

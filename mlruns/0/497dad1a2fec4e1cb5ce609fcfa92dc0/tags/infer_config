@@ -1,0 +1,1 @@
+{'batch_size': 64, 'Nsamples': 10, 'time_span': 96, 'most_likely_graph': True, 'intervention_idxs': None, 'intervention_values': None, 'samples_per_graph_groups': 10, 'movement': False}

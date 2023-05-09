@@ -41,7 +41,7 @@ class GaussianBase(nn.Module):
 
         mean = nn.Parameter(torch.zeros(self.input_dim, device=self.device), requires_grad=False)
         logscale = nn.Parameter(
-            self.log_scale_init * torch.ones(self.input_dim, device=self.device), requires_grad=train)
+            self.log_scale_init * torch.ones(self.input_dim, device=self.device), requires_grad=train)#False)#
         return mean, logscale
 
     def log_prob(self, z: torch.Tensor):
@@ -55,7 +55,7 @@ class GaussianBase(nn.Module):
             log_prob (batch, input_dim)
         """
         dist = td.Normal(self.mean_base, torch.exp(self.logscale_base))
-        return dist.log_prob(z).sum(-2)
+        return dist.log_prob(z).mean(-2)
 
     def sample(self, Nsamples: int):
         """
@@ -249,8 +249,7 @@ class TemporalConditionalSplineFlow(nn.Module):
         # Transform conditional placeholder to actual conditional distribution
         context_dict = {"X": X_history, "W": W}
         flow_dist = distrib.ConditionalTransformedDistribution(self.base_dist, self.transform).condition(context_dict)
-   
-        return flow_dist.log_prob(X_input)
+        return torch.stack([flow_dist.log_prob(X_input[:, i]) for i in range(X_input.shape[1])], dim=1).mean(-2)
 
     def sample(self, Nsamples: int, X_history: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         """

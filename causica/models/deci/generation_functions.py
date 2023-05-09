@@ -5,6 +5,244 @@ from torch import nn
 
 from ...utils.torch_utils import generate_fully_connected
 
+from  munch import DefaultMunch
+import torch.nn.functional as F
+import torch.fft
+from .layers.Embed import DataEmbedding, DataEmbedding_wo_pos
+from .layers.Conv_Blocks import Inception_Block_V1
+from .layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer, ConvLayer
+from .layers.SelfAttention_Family import ProbAttention, AttentionLayer
+from .layers.AutoCorrelation import AutoCorrelation, AutoCorrelationLayer
+from .layers.Autoformer_EncDec import (
+    Encoder as AutoEncoder, 
+    Decoder as AutoDecoder, 
+    EncoderLayer  as AutoEncoderLayer, 
+    DecoderLayer as AutoDecoderLayer, 
+    my_Layernorm, 
+    series_decomp)
+from .layers.ETSformer_EncDec import (
+    EncoderLayer as ETSEncoderLayer, 
+    Encoder as ETSEncoder, 
+    DecoderLayer as ETSDecoderLayer, 
+    Decoder as ETSDecoder, 
+    Transform
+)
+
+
+class TemporalFGNNIwithESTformer(nn.Module):
+    """
+    Autoformer is the first method to achieve the series-wise connection,
+    with inherent O(LlogL) complexity
+    Paper link: https://openreview.net/pdf?id=I55UqU-M11y
+    """
+
+    def __init__(self,
+        group_mask: torch.Tensor,
+        lag: int,
+        configs,
+        pre_len:int=1):
+
+        super().__init__()
+        self.seq_len = lag
+        self.pred_len = pre_len
+        self.num_nodes, _ = group_mask.shape
+        configs['pred_len'] = pre_len
+        configs['seq_len'] = lag
+        self.label_len = int(lag/2)
+        configs['label_len'] = int(self.label_len)
+        configs['enc_in'] = self.num_nodes
+        configs['dec_in'] = self.num_nodes
+        configs['c_out'] = self.num_nodes
+        configs = DefaultMunch.fromDict(configs)
+        assert configs.e_layers == configs.d_layers, "Encoder and decoder layers must be equal"
+
+        self.output_attention = configs.output_attention
+
+        # Embedding
+        self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq,
+                                           configs.dropout)
+
+        # Embedding
+        self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
+                                                  configs.dropout)
+        # Encoder
+        self.encoder = ETSEncoder(
+            [
+                ETSEncoderLayer(
+                    configs.d_model, configs.n_heads, configs.enc_in, configs.seq_len, self.pred_len, configs.top_k,
+                    dim_feedforward=configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                ) for _ in range(configs.e_layers)
+            ]
+        )
+        # Decoder
+        self.decoder = ETSDecoder(
+            [
+                ETSDecoderLayer(
+                    configs.d_model, configs.n_heads, configs.c_out, self.pred_len,
+                    dropout=configs.dropout,
+                ) for _ in range(configs.d_layers)
+            ],
+        )
+        self.transform = Transform(sigma=0.2)
+
+    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
+        if len(X.shape) == 2:
+            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
+        W_total = W_adj.sum(-1) # batch lag nodes
+        W_total = torch.where( W_total > 0, 1, 0)
+        X = X*W_total
+        return self.feed_forward(X)
+
+
+
+    def forecast(self, x_enc, x_dec, x_mark_enc=None, x_mark_dec=None):
+        with torch.no_grad():
+            if self.training:
+                x_enc = self.transform.transform(x_enc)
+        res = self.enc_embedding(x_enc, x_mark_enc)
+        level, growths, seasons = self.encoder(res, x_enc, attn_mask=None)
+
+        growth, season = self.decoder(growths, seasons)
+        preds = level[:, -1:] + growth + season
+        return preds
+
+    def feed_forward(self, x_enc):
+        
+        batch, lag, nodes = x_enc.shape
+        x_dec_ = torch.zeros(batch, self.pred_len, nodes).to(x_enc.device)
+        x_dec = torch.cat([x_enc[:, -self.label_len:], x_dec_],dim=1) 
+        dec_out = self.forecast(x_enc, x_dec)
+        return dec_out[:, -self.pred_len:, :]
+
+
+
+
+
+
+class TemporalFGNNIwithAutoformer(nn.Module):
+    """
+    Autoformer is the first method to achieve the series-wise connection,
+    with inherent O(LlogL) complexity
+    Paper link: https://openreview.net/pdf?id=I55UqU-M11y
+    """
+
+    def __init__(self,
+        group_mask: torch.Tensor,
+        lag: int,
+        configs,
+        pre_len:int=1):
+
+        super().__init__()
+        self.seq_len = lag
+        self.pred_len = pre_len
+        self.num_nodes, _ = group_mask.shape
+        configs['pred_len'] = pre_len
+        configs['seq_len'] = lag
+        self.label_len = int(lag/2)
+        configs['label_len'] = int(self.label_len)
+        configs['enc_in'] = self.num_nodes
+        configs['dec_in'] = self.num_nodes
+        configs['c_out'] = self.num_nodes
+        configs = DefaultMunch.fromDict(configs)
+
+
+        self.output_attention = configs.output_attention
+
+        # Decomp
+        kernel_size = configs.moving_avg
+        self.decomp = series_decomp(kernel_size)
+
+        # Embedding
+        self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
+                                                  configs.dropout)
+        # Encoder
+        self.encoder = AutoEncoder(
+            [
+                AutoEncoderLayer(
+                    AutoCorrelationLayer(
+                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
+                                        output_attention=configs.output_attention),
+                        configs.d_model, configs.n_heads),
+                    configs.d_model,
+                    configs.d_ff,
+                    moving_avg=configs.moving_avg,
+                    dropout=configs.dropout,
+                    activation=configs.activation
+                ) for l in range(configs.e_layers)
+            ],
+            norm_layer=my_Layernorm(configs.d_model)
+        )
+        # Decoder
+        self.dec_embedding = DataEmbedding_wo_pos(configs.dec_in, configs.d_model, configs.embed, configs.freq,
+                                                    configs.dropout)
+        self.decoder = AutoDecoder(
+            [
+                AutoDecoderLayer(
+                    AutoCorrelationLayer(
+                        AutoCorrelation(True, configs.factor, attention_dropout=configs.dropout,
+                                        output_attention=False),
+                        configs.d_model, configs.n_heads),
+                    AutoCorrelationLayer(
+                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
+                                        output_attention=False),
+                        configs.d_model, configs.n_heads),
+                    configs.d_model,
+                    configs.c_out,
+                    configs.d_ff,
+                    moving_avg=configs.moving_avg,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                )
+                for l in range(configs.d_layers)
+            ],
+            norm_layer=my_Layernorm(configs.d_model),
+            projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
+        )
+
+    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
+        if len(X.shape) == 2:
+            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
+        W_total = W_adj.sum(-1) # batch lag nodes
+        W_total = torch.where( W_total > 0, 1, 0)
+        X = X*W_total
+        return self.feed_forward(X)
+
+
+    def forecast(self, x_enc,x_dec, x_mark_enc=None, x_mark_dec=None):
+        # decomp init
+        mean = torch.mean(x_enc, dim=1).unsqueeze(
+            1).repeat(1, self.pred_len, 1)
+        zeros = torch.zeros([x_dec.shape[0], self.pred_len,
+                             x_dec.shape[2]], device=x_enc.device)
+        seasonal_init, trend_init = self.decomp(x_enc)
+        # decoder input
+        trend_init = torch.cat(
+            [trend_init[:, -self.label_len:, :], mean], dim=1)
+        seasonal_init = torch.cat(
+            [seasonal_init[:, -self.label_len:, :], zeros], dim=1)
+        # enc
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+        # dec
+        dec_out = self.dec_embedding(seasonal_init,  x_mark_dec)
+        seasonal_part, trend_part = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None,
+                                                 trend=trend_init)
+        # final
+        dec_out = trend_part + seasonal_part
+        return dec_out
+
+    def feed_forward(self, x_enc):
+        
+        batch, lag, nodes = x_enc.shape
+        x_dec_ = torch.zeros(batch, self.pred_len, nodes).to(x_enc.device)
+        x_dec = torch.cat([x_enc[:, -self.label_len:], x_dec_],dim=1) 
+        dec_out = self.forecast(x_enc, x_dec)
+        return dec_out[:, -self.pred_len:, :]
+
+
+
 
 class ContractiveInvertibleGNN(nn.Module):
     """
@@ -206,9 +444,10 @@ class TemporalContractiveInvertibleGNN(nn.Module):
         # Directly calling the feed_forward of TemporalFGNNI.
         # Requirement: self.f.feed_backward(X, W_adj). If W_adj has shape [lag+1, num_nodes, num_nodes], then it is applied for all batches
         # in X. If W_adj has shape [N_batch, lag+1, num_nodes, num_nodes], then each W_adj[i, ...] is applied for X[i, ...].
+        W_adj = W_adj*self.get_weighted_adjacency().unsqueeze(0)
         if len(X.shape) == 2:
             X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
-        return self.f.feed_forward(X, W_adj).squeeze(0) # batch nodes pre_len
+        return self.f.feed_forward(X, W_adj).squeeze(0).transpose(-1,-2)  # batch  pre_len nodes 
 
     # #change
     # def simulate_SEM_conditional(
@@ -660,6 +899,408 @@ class TemporalFGNNI(FGNNI):
         # X_rec *= self.group_mask  # shape (batch_size, num_nodes, processed_dim_all)
         return X_rec # shape (batch_size, processed_dim_all, pre_len)
 
+def FFT_for_Period(x, k=2):
+    # [B, T, C]
+    xf = torch.fft.rfft(x, dim=1)
+    # find period by amplitudes
+    frequency_list = abs(xf).mean(0).mean(-1)
+    frequency_list[0] = 0
+    _, top_list = torch.topk(frequency_list, k)
+    top_list = top_list.detach().cpu().numpy()
+    period = x.shape[1] // top_list
+    return period, abs(xf).mean(-1)[:, top_list]
+
+
+class TimesBlock(nn.Module):
+    def __init__(self, configs):
+        super(TimesBlock, self).__init__()
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        self.k = configs.top_k
+        # parameter-efficient design
+        self.conv = nn.Sequential(
+            Inception_Block_V1(configs.d_model, configs.d_ff,
+                               num_kernels=configs.num_kernels),
+            nn.GELU(),
+            Inception_Block_V1(configs.d_ff, configs.d_model,
+                               num_kernels=configs.num_kernels)
+        )
+
+    def forward(self, x):
+        B, T, N = x.size()
+        period_list, period_weight = FFT_for_Period(x, self.k)
+
+        res = []
+        for i in range(self.k):
+            period = period_list[i]
+            # padding
+            if (self.seq_len + self.pred_len) % period != 0:
+                length = (
+                                 ((self.seq_len + self.pred_len) // period) + 1) * period
+                padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
+                out = torch.cat([x, padding], dim=1)
+            else:
+                length = (self.seq_len + self.pred_len)
+                out = x
+            # reshape
+            out = out.reshape(B, length // period, period,
+                              N).permute(0, 3, 1, 2).contiguous()
+            # 2D conv: from 1d Variation to 2d Variation
+            out = self.conv(out)
+            # reshape back
+            out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
+            res.append(out[:, :(self.seq_len + self.pred_len), :])
+        res = torch.stack(res, dim=-1)
+        # adaptive aggregation
+        period_weight = F.softmax(period_weight, dim=1)
+        period_weight = period_weight.unsqueeze(
+            1).unsqueeze(1).repeat(1, T, N, 1)
+        res = torch.sum(res * period_weight, -1)
+        # residual connection
+        res = res + x
+        return res
+
+
+class TemporalFGNNIwithTimesNet(nn.Module):
+    """
+    This defines the temporal version of FGNNI, which supports temporal adjacency matrix. The main difference is the modification of
+    the feed_forward method, which generates the predictions based on the given parents (simultantanous + lagged). Additionally,
+    we also need to override the method initialize_embeddings() in FunctionSEM so that it is consistent with the temporal data format.
+
+    For now, since we use ANM for both simultaneous and lagged effect, we share the network parameters, and they only differ by the input embeddings.
+    """
+
+    def __init__(
+        self,
+        group_mask: torch.Tensor,
+        lag: int,
+        configs,
+        pre_len:int=1
+    ):
+        """
+        This initalize the temporal version of FGNNI.
+
+        Args:
+            group_mask: A mask of shape (num_nodes, num_processed_cols) such that group_mask[i, j] = 1 when col j is in group i.
+            device: The device to use.
+            lag: The lag for the model, should be >0.
+            embedding_size: The embedding size to use. Thus, the generated embeddings will be of shape [lag+1, num_nodes, embedding_size].
+            out_dim_g: The output dimension of the g function.
+            norm_layer: The normalization layer to use.
+            res_connection: Whether to use residual connection.
+            layers_g: The hidden layers of the g function.
+            layers_f: The hidden layers of the f function.
+        """
+        self.lag = lag
+        self.pre_len = pre_len
+        self.num_nodes, _ = group_mask.shape
+        configs['pred_len'] = pre_len
+        configs['seq_len'] = lag
+        configs = DefaultMunch.fromDict(configs)
+        # Call init of the parent class. Note that we need to overwrite the initialize_embeddings() method so that
+        # it is consistent with the temporal data format.
+        super().__init__()
+        self.model = nn.ModuleList([TimesBlock(configs)
+                                    for _ in range(configs.e_layers)])
+        self.enc_embedding = DataEmbedding(self.num_nodes, configs.d_model, configs.embed, configs.freq,
+                                           configs.dropout)
+        self.layer = configs.e_layers
+        self.layer_norm = nn.LayerNorm(configs.d_model)
+        # if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+        self.predict_linear = nn.Linear(
+            self.lag, self.lag+self.pre_len)
+        self.projection = nn.Linear(
+            configs.d_model, self.num_nodes, bias=True)
+        # if self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
+        #     self.projection = nn.Linear(
+        #         configs.d_model, configs.c_out, bias=True)
+        # if self.task_name == 'classification':
+        #     self.act = F.gelu
+        #     self.dropout = nn.Dropout(configs.dropout)
+        #     self.projection = nn.Linear(
+        #         configs.d_model * configs.seq_len, configs.num_class)
+    
+    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
+        if len(X.shape) == 2:
+            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
+        return self.feed_forward(X, W_adj)
+
+
+    def feed_forward(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
+        """
+        This method overwrites the one in FGNNI and computes the SEM children = f(parents) specified by the temporal W_adj. The implementation strategy is similar to
+        the static version.
+        Args:
+            X: Data from data loader with shape [batch_size, lag+1, processed_dim_all].
+            W_adj: The temporal adjacency matrix with shape [lag+1, num_nodes, num_nodes] or [batch_size, lag+1, num_nodes, num_nodes].
+        """
+
+        # Assert tht if W_adj has batch dimension and >1 and X.shape[0]>1, then W_adj.shape[0] must match X.shape[0].
+        # Assert X must have batch dimension.
+        # Expand the weighted adjacency matrix dims for later matmul operation.
+        if len(W_adj.shape) == 3:
+            W_adj = W_adj.unsqueeze(0)  # shape (1, lag+1, num_nodes, num_nodes)
+        assert len(X.shape) == 3, "The shape of X must be [batch, lag, proc_dim]"
+        assert (
+            W_adj.shape[1] == X.shape[1]
+        ), f"The lag of W_adj ({W_adj.shape[1]}) is inconsistent to the lag of X ({X.shape[1]})"
+        assert (
+            W_adj.shape[0] == 1 or W_adj.shape[0] == X.shape[0]
+        ), "The batch size of W_adj is inconsistent with X batch size"
+
+        # For network g input, we mask the input with group mask, and concatenate it with the node embeddings.
+        # Transform through g function. Output has shape shape (batch_size, lag+1, num_nodes, out_dim_g)
+        #   X shape (batch_size, lag, self.nodes)
+        #   W shape batch, lag nodes nodes
+        W_total = W_adj.sum(-1) # batch lag nodes
+        W_total = torch.where( W_total > 0, 1, 0)
+        X = X*W_total
+        dec_out = self.forecast(X)
+
+        # Masked the output with group_mask, followed by summation num_nodes to get correct node values.
+        # output has shape (batch_size, processed_dim_all)
+        # X_rec *= self.group_mask  # shape (batch_size, num_nodes, processed_dim_all)
+        return dec_out # shape (batch_size, pre_len, processed_dim_all, pre_len)
+
+    def forecast(self, x_enc, x_mark_enc=None):
+        # Normalization from Non-stationary Transformer
+        means = x_enc.mean(1, keepdim=True).detach()
+        x_enc = x_enc - means
+        stdev = torch.sqrt(
+            torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x_enc /= stdev
+
+        # embedding
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
+        enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(
+            0, 2, 1)  # align temporal dimension
+        # TimesNet
+        for i in range(self.layer):
+            enc_out = self.layer_norm(self.model[i](enc_out))
+        # porject back
+        dec_out = self.projection(enc_out)
+
+        # De-Normalization from Non-stationary Transformer
+        dec_out = dec_out * \
+                  (stdev[:, 0, :].unsqueeze(1).repeat(
+                      1, self.pre_len + self.lag, 1))
+        dec_out = dec_out + \
+                  (means[:, 0, :].unsqueeze(1).repeat(
+                      1, self.pre_len + self.lag, 1))
+        return dec_out[:, -self.pre_len:,]#batch pre_len nodes
+
+    def imputation(self, x_enc, x_mark_enc, mask):
+        # Normalization from Non-stationary Transformer
+        means = torch.sum(x_enc, dim=1) / torch.sum(mask == 1, dim=1)
+        means = means.unsqueeze(1).detach()
+        x_enc = x_enc - means
+        x_enc = x_enc.masked_fill(mask == 0, 0)
+        stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) /
+                           torch.sum(mask == 1, dim=1) + 1e-5)
+        stdev = stdev.unsqueeze(1).detach()
+        x_enc /= stdev
+
+        # embedding
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
+        # TimesNet
+        for i in range(self.layer):
+            enc_out = self.layer_norm(self.model[i](enc_out))
+        # porject back
+        dec_out = self.projection(enc_out)
+
+        # De-Normalization from Non-stationary Transformer
+        dec_out = dec_out * \
+                  (stdev[:, 0, :].unsqueeze(1).repeat(
+                      1, self.pred_len + self.seq_len, 1))
+        dec_out = dec_out + \
+                  (means[:, 0, :].unsqueeze(1).repeat(
+                      1, self.pred_len + self.seq_len, 1))
+        return dec_out
+
+    def anomaly_detection(self, x_enc):
+        # Normalization from Non-stationary Transformer
+        means = x_enc.mean(1, keepdim=True).detach()
+        x_enc = x_enc - means
+        stdev = torch.sqrt(
+            torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x_enc /= stdev
+
+        # embedding
+        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
+        # TimesNet
+        for i in range(self.layer):
+            enc_out = self.layer_norm(self.model[i](enc_out))
+        # porject back
+        dec_out = self.projection(enc_out)
+
+        # De-Normalization from Non-stationary Transformer
+        dec_out = dec_out * \
+                  (stdev[:, 0, :].unsqueeze(1).repeat(
+                      1, self.pred_len + self.seq_len, 1))
+        dec_out = dec_out + \
+                  (means[:, 0, :].unsqueeze(1).repeat(
+                      1, self.pred_len + self.seq_len, 1))
+        return dec_out
+
+    def classification(self, x_enc, x_mark_enc):
+        # embedding
+        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
+        # TimesNet
+        for i in range(self.layer):
+            enc_out = self.layer_norm(self.model[i](enc_out))
+
+        # Output
+        # the output transformer encoder/decoder embeddings don't include non-linearity
+        output = self.act(enc_out)
+        output = self.dropout(output)
+        # zero-out padding embeddings
+        output = output * x_mark_enc.unsqueeze(-1)
+        # (batch_size, seq_length * d_model)
+        output = output.reshape(output.shape[0], -1)
+        output = self.projection(output)  # (batch_size, num_classes)
+        return output
+
+
+class TemporalFGNNIwithInformer(nn.Module):
+    """
+    This defines the temporal version of FGNNI, which supports temporal adjacency matrix. The main difference is the modification of
+    the feed_forward method, which generates the predictions based on the given parents (simultantanous + lagged). Additionally,
+    we also need to override the method initialize_embeddings() in FunctionSEM so that it is consistent with the temporal data format.
+
+    For now, since we use ANM for both simultaneous and lagged effect, we share the network parameters, and they only differ by the input embeddings.
+    """
+
+    def __init__(
+        self,
+        group_mask: torch.Tensor,
+        lag: int,
+        configs,
+        pre_len:int=1
+    ):
+        """
+        This initalize the temporal version of FGNNI.
+
+        Args:
+            group_mask: A mask of shape (num_nodes, num_processed_cols) such that group_mask[i, j] = 1 when col j is in group i.
+            device: The device to use.
+            lag: The lag for the model, should be >0.
+            embedding_size: The embedding size to use. Thus, the generated embeddings will be of shape [lag+1, num_nodes, embedding_size].
+            out_dim_g: The output dimension of the g function.
+            norm_layer: The normalization layer to use.
+            res_connection: Whether to use residual connection.
+            layers_g: The hidden layers of the g function.
+            layers_f: The hidden layers of the f function.
+        """
+
+        self.lag = lag
+        self.pre_len = pre_len
+        self.num_nodes, _ = group_mask.shape
+        configs['pred_len'] = pre_len
+        configs['seq_len'] = lag
+        self.label_len = int(lag/2)
+        configs['label_len'] = int(self.label_len)
+        configs = DefaultMunch.fromDict(configs)
+        # Call init of the parent class. Note that we need to overwrite the initialize_embeddings() method so that
+        # it is consistent with the temporal data format.
+        super().__init__()
+
+        
+        # Embedding
+        self.enc_embedding = DataEmbedding(self.num_nodes, configs.d_model, configs.embed, configs.freq,
+                                           configs.dropout)
+        self.dec_embedding = DataEmbedding(self.num_nodes, configs.d_model, configs.embed, configs.freq,
+                                           configs.dropout)
+
+        # Encoder
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(
+                        ProbAttention(False, configs.factor, attention_dropout=configs.dropout,
+                                      output_attention=configs.output_attention),
+                        configs.d_model, configs.n_heads),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation
+                ) for l in range(configs.e_layers)
+            ],
+            # [
+            #     ConvLayer(
+            #         configs.d_model
+            #     ) for l in range(configs.e_layers - 1)
+            # ] if configs.distil and ('forecast' in configs.task_name) else None,
+            norm_layer=torch.nn.LayerNorm(configs.d_model)
+        )
+        # Decoder
+        self.decoder = Decoder(
+            [
+                DecoderLayer(
+                    AttentionLayer(
+                        ProbAttention(True, configs.factor, attention_dropout=configs.dropout, output_attention=False),
+                        configs.d_model, configs.n_heads),
+                    AttentionLayer(
+                        ProbAttention(False, configs.factor, attention_dropout=configs.dropout, output_attention=False),
+                        configs.d_model, configs.n_heads),
+                    configs.d_model,
+                    configs.d_ff,
+                    dropout=configs.dropout,
+                    activation=configs.activation,
+                )
+                for l in range(configs.d_layers)
+            ],
+            norm_layer=torch.nn.LayerNorm(configs.d_model),
+            projection=nn.Linear(configs.d_model, self.num_nodes, bias=True)
+        )
+        
+    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
+        if len(X.shape) == 2:
+            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
+        W_total = W_adj.sum(-1) # batch lag nodes
+        W_total = torch.where( W_total > 0, 1, 0)
+        X = X*W_total
+        return self.feed_forward(X)
+
+    
+   
+    def long_forecast(self, x_enc,  x_dec,  x_mark_enc=None):
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        dec_out = self.dec_embedding(x_dec, x_mark_enc)
+        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+
+        dec_out = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None)
+
+        return dec_out  # [B, L, D]
+    
+    def short_forecast(self, x_enc, x_dec,  x_mark_enc=None):
+        # Normalization
+        mean_enc = x_enc.mean(1, keepdim=True).detach()  # B x 1 x E
+        x_enc = x_enc - mean_enc
+        std_enc = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()  # B x 1 x E
+        x_enc = x_enc / std_enc
+        
+
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        dec_out = self.dec_embedding(x_dec, x_mark_enc)
+        enc_out, attns = self.encoder(enc_out, attn_mask=None)
+
+        dec_out = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None)
+
+        dec_out = dec_out * std_enc + mean_enc
+        return dec_out  # [B, L, D]
+
+    def feed_forward(self, x_enc):
+        batch, lag, nodes = x_enc.shape
+        x_dec_ = torch.zeros(batch, self.pre_len, nodes).to(x_enc.device)
+        x_dec = torch.cat([x_enc[:, -self.label_len:], x_dec_],dim=1)  # B l+p D
+        # if self.task_name == 'long_term_forecast':
+        dec_out = self.long_forecast(x_enc, x_dec)
+        return dec_out[:, -self.pre_len:, :]  # [B, L, D]
+        # if self.task_name == 'short_term_forecast':
+        #     dec_out = self.short_forecast(x_enc,  x_dec, x_mask)
+        #     return dec_out[:, -self.pred_len:, :]  # [B, L, D]
+        
+
 
 class TemporalHyperNet(nn.Module):
     """
@@ -751,15 +1392,15 @@ class TemporalHyperNet(nn.Module):
             res_connection=res_connection,
         )
         # Initialize the associated weights by calling self.W = self._initialize_W(). self.W has shape [lag+1, num_nodes, num_nodes]
-        self.W = self._initialize_W() #[lag, num_nodes, num_nodes]
+        # self.W = self._initialize_W() #[lag, num_nodes, num_nodes]
 
-    def _initialize_W(self) -> torch.Tensor:
-        """
-        Initializes the associated weight with shape [lag, num_nodes, num_nodes]. Currently, initialize to zero.
-        Returns: the initialized weight with shape [lag, num_nodes, num_nodes]
-        """
-        W = torch.zeros(self.lag , self.num_nodes, self.num_nodes, device=self.device)
-        return nn.Parameter(W, requires_grad=True)
+    # def _initialize_W(self) -> torch.Tensor:
+    #     """
+    #     Initializes the associated weight with shape [lag, num_nodes, num_nodes]. Currently, initialize to zero.
+    #     Returns: the initialized weight with shape [lag, num_nodes, num_nodes]
+    #     """
+    #     W = torch.zeros(self.lag , self.num_nodes, self.num_nodes, device=self.device)
+    #     return nn.Parameter(W, requires_grad=True)
     
     def initialize_embeddings(self) -> torch.Tensor:
         """
@@ -793,7 +1434,7 @@ class TemporalHyperNet(nn.Module):
         assert W.dim() == 4, "W must have shape [batch, lag+1, num_node, num_node]"
 
         # assert lag
-        assert X_hist.shape[1] == W.shape[1] - 1, "The input observation should be the history observation."
+        assert X_hist.shape[1] == W.shape[1], "The input observation should be the history observation."
         X_hist = X_hist.unsqueeze(-2)  # [batch, lag, 1, proc_dim]
         X_hist_masked = X_hist * self.group_mask  # [batch, lag, node, proc_dim]
         E = self.embeddings.expand(
@@ -805,13 +1446,13 @@ class TemporalHyperNet(nn.Module):
             [X_hist_masked, E_lag], dim=-1
         )  # shape (batch_size, lag, num_nodes, embedding_size+proc_dim)
         X_emb = self.g(X_in_g)  # shape (batch_size, lag, num_nodes, out_dim_g)
-        W_lag_exp = W[:, 1:, :, :]  # shape [batch, lag, node, node]
+
         
-        # # change  add weight
-        W_lag_exp = W_lag_exp*self.W.unsqueeze(0)
+        # # # change  add weight
+        # W_lag_exp = W_lag_exp*self.W.unsqueeze(0)
 
         X_aggr_sum = torch.einsum(
-            "klij,klio->kjo", W_lag_exp.flip([1]), X_emb
+            "klij,klio->kjo", W.flip([1]), X_emb
         )  # shape (batch_size, num_nodes, out_dim_g)
 
         X_in_f = torch.cat([X_aggr_sum, E_inst], dim=-1)  # shape (batch_size, num_nodes, embedding_size+out_dim_g)

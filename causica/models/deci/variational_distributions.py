@@ -517,7 +517,9 @@ class TemporalThreeWayGrahpDist(nn.Module):
         # Entropy for lagged dist
         # batch_shape [lag], event_shape [num_nodes, num_nodes]
         dist_lag = td.Independent(td.Bernoulli(logits=self.final_logits_lag[1, ...] - self.final_logits_lag[0, ...]), 2)
+        # entropies_lag = dist_lag.entropy().sum() #change
         entropies_lag = dist_lag.entropy().sum()
+        # input(dist_lag.entropy().size())
         return entropies_lag 
 
     def sample_A(self, x_history) -> torch.Tensor:

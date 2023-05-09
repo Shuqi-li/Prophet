@@ -1,0 +1,6 @@
+artifact_location: file:///data/shuqili/nni_causica/mlruns/5
+creation_time: 1683411083650
+experiment_id: '5'
+last_update_time: 1683411083650
+lifecycle_stage: active
+name: exchange_rate.rhino_informer

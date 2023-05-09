@@ -1,0 +1,103 @@
+{
+    "auxiliary_variables": [],
+    "used_cols": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+    ],
+    "variables": [
+        {
+            "always_observed": true,
+            "group_name": "Column 0",
+            "is_latent": false,
+            "lower": 0.483297,
+            "name": "Column 0",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 0.97795
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 1",
+            "is_latent": false,
+            "lower": 1.372313,
+            "name": "Column 1",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 2.109
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 2",
+            "is_latent": false,
+            "lower": 0.618582,
+            "name": "Column 2",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 1.091524
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 3",
+            "is_latent": false,
+            "lower": 0.548617,
+            "name": "Column 3",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 1.014096
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 4",
+            "is_latent": false,
+            "lower": 0.109292,
+            "name": "Column 4",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 0.211265
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 5",
+            "is_latent": false,
+            "lower": 0.006254,
+            "name": "Column 5",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 0.012327
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 6",
+            "is_latent": false,
+            "lower": 0.393153,
+            "name": "Column 6",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 0.81635
+        },
+        {
+            "always_observed": true,
+            "group_name": "Column 7",
+            "is_latent": false,
+            "lower": 0.523834,
+            "name": "Column 7",
+            "query": true,
+            "target": false,
+            "type": "continuous",
+            "upper": 0.742615
+        }
+    ]
+}

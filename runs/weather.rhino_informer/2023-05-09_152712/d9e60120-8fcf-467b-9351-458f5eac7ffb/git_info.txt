@@ -1,0 +1,4016 @@
+sys.argv: ['/data/shuqili/nni_causica/causica/run_experiment.py', 'weather', '--model_type', 'rhino_informer', '-dc', 'configs/dataset_config_temporal_causal_dataset_all.json', '--model_config', 'configs/rhino/model_config_rhino_weather_gaussian.json', '-dv', 'gpu', '-i', '-ifc', 'infer_config_temporal_causal_dataset.json']
+Git commit: 3aa3b5d7c02a84a7af0bef024f0b58dbbf1f60c5
+Active branch: main
+Git diff:
+diff --git a/causica/argument_parser.py b/causica/argument_parser.py
+index 4d44c99..b42862f 100644
+--- a/causica/argument_parser.py
++++ b/causica/argument_parser.py
+@@ -96,6 +96,11 @@ def get_parser() -> argparse.ArgumentParser:
+         type=str,
+         default="deci",
+         choices=[
++            "rhino",
++            "rhino_timesnet",
++            "rhino_informer",
++            "rhino_etsformer",
++            "rhino_autoformer",
+             "visl",
+             "deci",
+             "deci_gaussian",
+@@ -114,7 +119,6 @@ def get_parser() -> argparse.ArgumentParser:
+             "informed_deci",
+             "varlingam",
+             "fold_time_deci",
+-            "rhino",
+             "ddeci",
+             "admg_ddeci",
+             "bowfree_ddeci",
+diff --git a/causica/experiment/run_single_seed_experiment.py b/causica/experiment/run_single_seed_experiment.py
+index bbe7eea..5e5281c 100644
+--- a/causica/experiment/run_single_seed_experiment.py
++++ b/causica/experiment/run_single_seed_experiment.py
+@@ -5,6 +5,7 @@ import threading
+ import time
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional, Tuple, Union, cast
++import nni
+ 
+ import mlflow
+ import psutil
+@@ -96,6 +97,14 @@ class ExperimentArguments:
+ 
+ 
+ def run_single_seed_experiment(args: ExperimentArguments):
++
++    optimized_params = nni.get_next_parameter()
++    
++    optimized_params_model = {k:v for k,v in optimized_params.items() if k in args.model_config}
++    optimized_params_train = {k:v for k,v in optimized_params.items() if k in args.train_hypers}
++    args.model_config.update(optimized_params_model)
++    args.train_hypers.update(optimized_params_train)
++
+     # Set up loggers
+     logger = logging.getLogger()
+     log_format = "%(asctime)s %(filename)s:%(lineno)d[%(levelname)s]%(message)s"
+@@ -153,6 +162,7 @@ def run_single_seed_experiment(args: ExperimentArguments):
+             train_hypers=args.train_hypers,
+             prior_path=args.prior_path,
+             constraint_path=args.constraint_path,
++            infer_config=args.infer_config,
+         )
+         running_times["train/running-time"] = (time.time() - start_time) / 60
+     save_json(args.dataset_config, os.path.join(model.save_dir, "dataset_config.json"))
+@@ -161,12 +171,15 @@ def run_single_seed_experiment(args: ExperimentArguments):
+     # Imputation
+     if args.run_inference:
+         assert args.infer_config is not None
+-        run_eval_sample(
++        result = run_eval_sample(
+             model=model,
+             dataset=dataset,
+             infer_config=args.infer_config,
+             seed=args.dataset_seed if isinstance(args.dataset_seed, int) else args.dataset_seed[0],
+         )
++        
++        #nni.report_final_result(result['test']['metric']['mse_mean'])
++
+         # if not isinstance(model, IModelForImputation):
+         #     raise ValueError("This model class does not support imputation.")
+         # # TODO 18412: move impute_train_data flag into each dataset's imputation config rather than hardcoding here
+diff --git a/causica/experiment/steps/eval_step.py b/causica/experiment/steps/eval_step.py
+index 231f19f..f84044d 100644
+--- a/causica/experiment/steps/eval_step.py
++++ b/causica/experiment/steps/eval_step.py
+@@ -62,6 +62,7 @@ def run_eval_sample(
+         os.path.join(result_path, "results.json")
+     )
+     mlflow.log_metric("impute/running-time", (dt.datetime.utcnow() - start_time).total_seconds() / 60)
++    return results
+ 
+ def run_eval_main(
+     model: IModelForImputation,
+diff --git a/causica/experiment/steps/train_step.py b/causica/experiment/steps/train_step.py
+index b992bf4..93b1d34 100644
+--- a/causica/experiment/steps/train_step.py
++++ b/causica/experiment/steps/train_step.py
+@@ -2,6 +2,7 @@ from logging import Logger
+ from typing import Any, Dict, Optional, Union
+ 
+ import mlflow
++import nni
+ 
+ from ...datasets.dataset import Dataset, SparseDataset
+ from ...datasets.variables import Variables
+@@ -19,6 +20,7 @@ def run_train_main(
+     device: str,
+     model_config: Dict[str, Any],
+     train_hypers: Dict[str, Any],
++    infer_config: Dict[str, Any],
+     prior_path: Optional[str] = None,
+     constraint_path: Optional[str] = None,
+ ) -> IModel:
+@@ -44,6 +46,8 @@ def run_train_main(
+     logger.info("Training model.")
+ 
+     # TODO fix typing. mypy rightly complains that we may pass SparseDataset to a model that can only handle (dense) Dataset here.
+-    model.run_train(dataset=dataset, train_config_dict=train_hypers)  # type: ignore
++    best_mse = model.run_train(dataset=dataset, train_config_dict=train_hypers, infer_config_dict=infer_config)  # type: ignore
++
++    nni.report_final_result(best_mse)
+ 
+     return model
+diff --git a/causica/models/deci/base_distributions.py b/causica/models/deci/base_distributions.py
+index e31cf55..c322fbc 100644
+--- a/causica/models/deci/base_distributions.py
++++ b/causica/models/deci/base_distributions.py
+@@ -41,7 +41,7 @@ class GaussianBase(nn.Module):
+ 
+         mean = nn.Parameter(torch.zeros(self.input_dim, device=self.device), requires_grad=False)
+         logscale = nn.Parameter(
+-            self.log_scale_init * torch.ones(self.input_dim, device=self.device), requires_grad=train)
++            self.log_scale_init * torch.ones(self.input_dim, device=self.device), requires_grad=train)#False)#
+         return mean, logscale
+ 
+     def log_prob(self, z: torch.Tensor):
+@@ -55,7 +55,7 @@ class GaussianBase(nn.Module):
+             log_prob (batch, input_dim)
+         """
+         dist = td.Normal(self.mean_base, torch.exp(self.logscale_base))
+-        return dist.log_prob(z).sum(-2)
++        return dist.log_prob(z).mean(-2)
+ 
+     def sample(self, Nsamples: int):
+         """
+@@ -249,8 +249,7 @@ class TemporalConditionalSplineFlow(nn.Module):
+         # Transform conditional placeholder to actual conditional distribution
+         context_dict = {"X": X_history, "W": W}
+         flow_dist = distrib.ConditionalTransformedDistribution(self.base_dist, self.transform).condition(context_dict)
+-   
+-        return flow_dist.log_prob(X_input)
++        return torch.stack([flow_dist.log_prob(X_input[:, i]) for i in range(X_input.shape[1])], dim=1).mean(-2)
+ 
+     def sample(self, Nsamples: int, X_history: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+         """
+diff --git a/causica/models/deci/deci.py b/causica/models/deci/deci.py
+index 6a91ca8..67aca58 100755
+--- a/causica/models/deci/deci.py
++++ b/causica/models/deci/deci.py
+@@ -106,7 +106,7 @@ class DECI(
+         graph_constraint_matrix: Optional[np.ndarray] = None,
+         dense_init: bool = False,
+         embedding_size: Optional[int] = None,
+-        log_scale_init: float =  -10.0,
++        log_scale_init: float =  -0.0,
+         disable_diagonal_eval: bool = True,
+         pre_len:int = 1,
+     ):
+@@ -533,10 +533,10 @@ class DECI(
+             Log probability of A for prior distribution, a number.
+         """
+ 
+-        sparse_term = self.lambda_sparse * A.abs().sum()
++        sparse_term = -self.lambda_sparse * A.abs().sum()
+         if self.exist_prior:
+             prior_term = (
+-                self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
++                -self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
+             )
+             return sparse_term + prior_term
+         else:
+@@ -1299,11 +1299,15 @@ class DECI(
+             ELBO = log_p_term + imputation_entropy + log_p_A_term - log_q_A_term - penalty_dag_term
+         loss = -ELBO + avg_reconstruction_err * train_config_dict["reconstruction_loss_factor"]
+ 
++        
++        #change
++
+         if adj_true is not None and compute_cd_fscore:
+             adj_pred = self.get_adj_matrix().astype(float).round()
+             results = edge_prediction_metrics_multisample(adj_true, adj_pred, adj_matrix_mask=None)
+             tracker["cd_fscore"].append(results["adjacency_fscore"])
+ 
++        
+         tracker["loss"].append(loss.item())
+         tracker["penalty_dag"].append(elbo_terms["penalty_dag"].item())
+         tracker["penalty_dag_weighed"].append(penalty_dag_term.item())
+@@ -1430,7 +1434,7 @@ class DECI(
+         self,
+         dataset: Dataset,
+         train_config_dict: Optional[Dict[str, Any]] = None,
+-        report_progress_callback: Optional[Callable[[str, int, int], None]] = None,
++        infer_config_dict: Optional[Dict[str, Any]] = None,
+     ) -> None:
+         """
+         Runs training.
+@@ -1439,7 +1443,7 @@ class DECI(
+             train_config_dict = {}
+ 
+         # Tracker for the best logprob during training
+-        best_log_p_x = -np.inf
++        
+ 
+         dataloader, num_samples = self._create_dataset_for_deci(dataset, train_config_dict)
+ 
+@@ -1455,17 +1459,9 @@ class DECI(
+         writer = SummaryWriter(log_path, flush_secs=1)
+         print("Saving logs to", log_path)
+ 
+-        rho = train_config_dict["rho"]
+-        alpha = train_config_dict["alpha"]
+-        progress_rate = train_config_dict["progress_rate"]
+-        base_beta = train_config_dict["beta"] if "beta" in train_config_dict else 1.0
++
+         base_lr = train_config_dict["learning_rate"]
+-        anneal_beta = train_config_dict["anneal_beta"] if "anneal_beta" in train_config_dict else None
+-        anneal_beta_max_steps = (
+-            train_config_dict["anneal_beta_max_steps"]
+-            if "anneal_beta_max_steps" in train_config_dict
+-            else int(train_config_dict["max_steps_auglag"] / 2)
+-        )
++        patience =  train_config_dict["patience"]
+ 
+         # This allows the setting of the starting learning rate of each of the different submodules in the config, e.g. "likelihoods_learning_rate".
+         parameter_list = [
+@@ -1475,243 +1471,20 @@ class DECI(
+                 "name": name,
+             }
+             for name, module in self.named_children()
+-        ]
++        ] 
+ 
+-        self.opt = torch.optim.Adam(parameter_list)
+ 
+-        # Outer optimization loop
+-        base_idx = 0
+-        dag_penalty_prev = float("inf")
+-        num_below_tol = 0
+-        num_max_rho = 0
+-        num_not_done = 0
+-        if isinstance(dataset, TemporalDataset):
+-            # Metrics dict, this is only used for AR-DECI
+-            metrics_dict: dict = {}
+-        for step in range(train_config_dict["max_steps_auglag"]):
+ 
+-            # Stopping if DAG conditions satisfied
+-            patience_dag_reached = train_config_dict.get("patience_dag_reached", 5)
+-            patience_max_rho = train_config_dict.get("patience_max_rho", 3)
+-            if num_below_tol >= patience_dag_reached:
+-                print(f"DAG penalty below tolerance for more than {patience_dag_reached} steps")
+-                break
+-            elif num_max_rho >= patience_max_rho:
+-                print(f"Above max rho for more than {patience_max_rho} steps")
+-                break
+-
+-            if rho >= train_config_dict["safety_rho"]:
+-                num_max_rho += 1
+-
+-            # Anneal beta.
+-            if anneal_beta == "linear":
+-                beta = base_beta * min((step + 1) / anneal_beta_max_steps, 1.0)
+-            elif anneal_beta == "reverse":
+-                beta = base_beta * max((anneal_beta_max_steps - step) / anneal_beta_max_steps, 0.2)
+-            else:
+-                beta = base_beta
+-
+-            # Logging outer progress and adjacency matrix
+-            adj_true = None
+-            bidirected_adj_true = None
+-            if (
+-                isinstance(dataset, CausalDataset)
+-                and dataset.has_adjacency_data_matrix
+-                and not hasattr(self, "latent_variables")
+-            ):
+-                adj_true = dataset.get_adjacency_data_matrix()
+-                assert adj_true is not None
+-            elif (
+-                isinstance(dataset, LatentConfoundedCausalDataset)
+-                and dataset.has_directed_adjacency_data_matrix
+-                and dataset.has_bidirected_adjacency_data_matrix
+-            ):
+-                adj_true = dataset.get_directed_adjacency_data_matrix()
+-                bidirected_adj_true = dataset.get_bidirected_adjacency_data_matrix()
++        self.opt = torch.optim.Adam(parameter_list)
+ 
++        best_log_p_x = -np.inf
++        best_mse = np.inf
++        outer_step_start_time =None
++        count = 0
++        for step in range(train_config_dict["max_steps_auglag"]):
++            count += 1
+             # Inner loop
+-            print(f"Auglag Step: {step}")
+-
+-            print(f"Beta Value: {beta}")
+-
+-            # Optimize adjacency for fixed rho and alpha
+-            outer_step_start_time = time.time()
+-            done_inner, tracker_loss_terms = self.optimize_inner_auglag(
+-                rho, alpha, beta, step, num_samples, dataloader, train_config_dict, adj_true, bidirected_adj_true
+-            )
+-            outer_step_time = time.time() - outer_step_start_time
+-            # dag_penalty = np.mean(tracker_loss_terms["penalty_dag"])
+-
+-            # Print some stats about the DAG distribution
+-            # print(f"Dag penalty after inner: {dag_penalty:.10f}")
+-            print("Time taken for this step", outer_step_time)
+-            # try:
+-            #     directed_adjacency, bidirected_adjacency = cast(Any, self).get_admg_matrices(
+-            #         do_round=False, most_likely_graph=True, samples=1
+-            #     )
+-            #     print("Unrounded directed matrix:")
+-            #     print(directed_adjacency)
+-            #     print("Unrounded bidirected matrix:")
+-            #     print(bidirected_adjacency)
+-
+-            # except AttributeError:
+-            #     matrix = self.get_adj_matrix(do_round=True, most_likely_graph=True, samples=1)
+-            #     prob_matrix = self.get_adj_matrix(do_round=False, most_likely_graph=True, samples=1)
+-            #     print("Unrounded adj matrix:")
+-            #     print(prob_matrix)
+-            #     print(f"Number of edges in adj matrix (unrounded) {prob_matrix.sum()}, (rounded) {matrix.sum()}.")
+-
+-            # # Update alpha (and possibly rho) if inner optimization done or if 2 consecutive not-done
+-            # if done_inner or num_not_done == 1:
+-            #     num_not_done = 0
+-            #     if dag_penalty < train_config_dict["tol_dag"]:
+-            #         num_below_tol += 1
+-            #     if report_progress_callback is not None:
+-            #         report_progress_callback(self.model_id, step + 1, train_config_dict["max_steps_auglag"])
+-
+-            #     with torch.no_grad():
+-            #         if dag_penalty > dag_penalty_prev * progress_rate:
+-            #             print(f"Updating rho, dag penalty prev: {dag_penalty_prev: .10f}")
+-            #             rho *= 10.0
+-            #         else:
+-            #             print("Updating alpha.")
+-            #             dag_penalty_prev = dag_penalty
+-            #             alpha += rho * dag_penalty
+-            #             if dag_penalty == 0.0:
+-            #                 alpha *= 5
+-            #         if rho >= train_config_dict["safety_rho"]:
+-            #             alpha *= 5
+-            #         rho = min([rho, train_config_dict["safety_rho"]])
+-            #         alpha = min([alpha, train_config_dict["safety_alpha"]])
+-
+-            # else:
+-            #     num_not_done += 1
+-            #     print("Not done inner optimization.")
+-
+-            if (
+-                isinstance(dataset, LatentConfoundedCausalDataset)
+-                and dataset.has_directed_adjacency_data_matrix
+-                and dataset.has_bidirected_adjacency_data_matrix
+-            ):
+-                directed_adj_pred, bidirected_adj_pred = cast(Any, self).get_admg_matrices(do_round=True, samples=100)
+-                directed_adj_metrics = edge_prediction_metrics_multisample(adj_true, directed_adj_pred)
+-                bidirected_adj_metrics = edge_prediction_metrics_multisample(bidirected_adj_true, bidirected_adj_pred)
+-                adj_metrics = {
+-                    **{f"directed_{k}": v for k, v in directed_adj_metrics.items()},
+-                    **{f"bidirected_{k}": v for k, v in bidirected_adj_metrics.items()},
+-                }
+-            elif isinstance(dataset, CausalDataset) and dataset.has_adjacency_data_matrix:
+-                adj_matrix = self.get_adj_matrix(do_round=True, samples=100)
+-                if isinstance(dataset, TemporalDataset):
+-                    adj_metrics = eval_temporal_causal_discovery(
+-                        dataset, self, disable_diagonal_eval=self.disable_diagonal_eval
+-                    )
+-                    if dataset.has_val_data:
+-                        val_likelihood = self._compute_val_likelihood(
+-                            val_dataloader, Nsamples_per_graph=100, most_likely_graph=False
+-                        )
+-                        adj_metrics["val_likelihood"] = val_likelihood
+-                    assert adj_true is not None
+-                    print_AR_DECI_metrics(adj_metrics, is_aggregated=(adj_true.ndim == 2))
+-                    # Update metrics dict and save
+-                    update_AR_DECI_metrics_dict(metrics_dict, adj_metrics, is_aggregated=(adj_true.ndim == 2))
+-                    save_json(metrics_dict, path=os.path.join(self.save_dir, "metrics.json"))
+-
+-                else:
+-                    subgraph_mask = dataset.get_known_subgraph_mask_matrix()
+-                    adj_metrics = edge_prediction_metrics_multisample(
+-                        adj_true,
+-                        adj_matrix,
+-                        adj_matrix_mask=subgraph_mask,
+-                        compute_mean=False,
+-                    )
+-            else:
+-                adj_metrics = {}
+-            # Calculating the log prob as the average over the terms in the tracker
+-            # and saving if it's better than the previous best.
+-            avg_tracker_log_px = np.mean(tracker_loss_terms["log_p_x"])
+-            self.log_p_x.fill_(avg_tracker_log_px)
+-            if avg_tracker_log_px > best_log_p_x:
+-                print(f"Saved new best checkpoint with {self.log_p_x} instead of {best_log_p_x}")
+-                self.save(best=True)
+-                best_log_p_x = avg_tracker_log_px
+-
+-            base_idx = _log_epoch_metrics(writer, tracker_loss_terms, adj_metrics, step, outer_step_time, base_idx)
+-
+-            # Save model
+-            self.save()
+-
+-            # # Print the current values of the auglag parameters rho, alpha
+-            # if dag_penalty_prev is not None:
+-            #     print(f"Dag penalty: {dag_penalty:.15f}")
+-            #     print(f"Rho: {rho:.2f}, alpha: {alpha:.2f}")
+-
+-    def optimize_inner_auglag(
+-        self,
+-        rho: float,
+-        alpha: float,
+-        beta: float,
+-        step: int,
+-        num_samples: int,
+-        dataloader,
+-        train_config_dict: Optional[Dict[str, Any]] = None,
+-        adj_true: Optional[np.ndarray] = None,
+-        bidirected_adj_true: Optional[np.ndarray] = None,
+-        n_spline_sample: int = 32,
+-        spline_ewma_alpha: float = 0.05,
+-    ) -> Tuple[bool, Dict]:
+-        """
+-        Optimize for a given alpha and rho
+-        Args:
+-            rho: Parameter used to scale the penalty_dag term in the prior. Defaults to None.
+-            alpha: Parameter used to scale the penalty_dag term in the prior. Defaults to None.
+-            beta: KL term annealing coefficient
+-            step: Auglag step
+-            num_samples: Number of samples in the dataset
+-            dataloader: Dataset to generate a dataloader for.
+-            train_config_dict: Dictionary with training hyperparameters.
+-            adj_true: ground truth adj matrix
+-            bidirected_adj_true: ground truth bidirected adj matrix
+-            n_spline_samples: to estimate the non-zero mean of the spline noise distributions by sampling. These are
+-                aggregated using an exponentially weighted moving average.
+-            alpha: exponentially weighted moving average parameter for spline means.
+-
+-        Returns:
+-            done_opt: boolean indicating if optimization is done.
+-            tracker_loss_terms: Dictionary for tracking loss terms
+-        """
+-        if train_config_dict is None:
+-            train_config_dict = {}
+-
+-        def get_lr():
+-            for param_group in self.opt.param_groups:
+-                return param_group["lr"]
+-
+-        def set_lr(factor):
+-            for param_group in self.opt.param_groups:
+-                param_group["lr"] = param_group["lr"] * factor
+-
+-        def initialize_lr():
+-            base_lr = train_config_dict["learning_rate"]
+-            for param_group in self.opt.param_groups:
+-                name = param_group["name"]
+-                param_group["lr"] = train_config_dict.get(f"{name}_learning_rate", base_lr)
+-
+-        lim_updates_down = 3
+-        num_updates_lr_down = 0
+-        auglag_inner_early_stopping_lag = train_config_dict.get("auglag_inner_early_stopping_lag", 1500)
+-        auglag_inner_reduce_lr_lag = train_config_dict.get("auglag_inner_reduce_lr_lag", 500)
+-        initialize_lr()
+-        print("LR:", get_lr())
+-        best_loss = np.nan
+-        last_updated = -1
+-        done_opt = False
+-
+-        tracker_loss_terms: Dict = defaultdict(list)
+-        inner_step = 0
+-
+-        while inner_step < train_config_dict["max_auglag_inner_epochs"]:  # and not done_steps:
+-
++            print(f"Auglag Epoch: {step}")
+             for x, mask_train_batch in dataloader:
+                 input_mask, _ = get_input_and_scoring_masks(
+                     mask_train_batch,
+@@ -1720,201 +1493,44 @@ class DECI(
+                     score_reconstruction=True,
+                 )
+                 loss, tracker_loss_terms = self.compute_loss(
+-                    step,
+                     x,
+                     mask_train_batch,
+                     input_mask,
+                     num_samples,
+                     tracker_loss_terms,
+-                    train_config_dict,
+-                    alpha,
+-                    rho,
+-                    adj_true,
+-                    bidirected_adj_true=bidirected_adj_true,
+-                    beta=beta,
+-                    compute_cd_fscore=train_config_dict.get("compute_cd_fscore", False),
++                    train_config_dict
+                 )
+                 self.opt.zero_grad()
+                 loss.backward()
+                 self.opt.step()
+ 
+-                # For MSE metric, update an estimate of the spline means
+-                if not isinstance(self.likelihoods["continuous"], (GaussianBase, TemporalConditionalSplineFlow)):
+-                    error_dist_mean = self.likelihoods["continuous"].sample(n_spline_sample).mean(0)
+-                    self.spline_mean_ewma = (
+-                        spline_ewma_alpha * error_dist_mean + (1 - spline_ewma_alpha) * self.spline_mean_ewma
+-                    )
+ 
+                 inner_step += 1
+ 
+                 if int(inner_step) % 100 == 0:
+                     self.print_tracker(inner_step, tracker_loss_terms)
+-                if int(inner_step) % 500 == 0:
+-                    break
+-                elif inner_step >= train_config_dict["max_auglag_inner_epochs"]:
+-                    break
+-
+-            # Save if loss improved
+-            if np.isnan(best_loss) or np.mean(tracker_loss_terms["loss"][-10:]) < best_loss:
+-                best_loss = np.mean(tracker_loss_terms["loss"][-10:])
+-                best_inner_step = inner_step
+-            # Check if has to reduce step size
+-            if (
+-                inner_step >= best_inner_step + auglag_inner_reduce_lr_lag
+-                and inner_step >= last_updated + auglag_inner_reduce_lr_lag
+-            ):
+-                last_updated = inner_step
+-                num_updates_lr_down += 1
+-                set_lr(0.1)
+-                print(f"Reducing lr to {get_lr():.5f}")
+-                if num_updates_lr_down >= 2:
+-                    done_opt = True
+-                if num_updates_lr_down >= lim_updates_down:
+-                    done_opt = True
+-                    print(f"Exiting at inner step {inner_step}.")
+-                    # done_steps = True
+-                    break
+-            if inner_step >= best_inner_step + auglag_inner_early_stopping_lag:
+-                done_opt = True
+-                print(f"Exiting at inner step {inner_step}.")
+-                # done_steps = True
+-                break
+-            if np.any(np.isnan(tracker_loss_terms["loss"])):
+-                print(tracker_loss_terms)
+-                print("Loss is nan, I'm done.", flush=True)
+-                # done_steps = True
++            mse_sample = self.run_inference_with_dataloader(val_dataloader, infer_config_dict)
++            val_mse = mse_sample.mean()
++            if val_mse < best_mse:
++                self.save(best=True)
++                print(f"Saved new best checkpoint with {val_mse} instead of {best_mse}")
++                best_mse = val_mse
++                count = 0
++            if count > patience:
+                 break
+-        self.print_tracker(inner_step, tracker_loss_terms)
+-        print(f"Best model found at innner step {best_inner_step}, with Loss {best_loss:.2f}")
+-        return done_opt, tracker_loss_terms
+-
+-    def posterior_expected_optimal_policy(
+-        self,
+-        X: torch.Tensor,
+-        intervention_idxs: Union[torch.Tensor, np.ndarray],
+-        objective_function: Callable[
+-            [
+-                Union[torch.Tensor, np.ndarray],
+-                Optional[Union[torch.Tensor, np.ndarray]],
+-                Optional[Union[torch.Tensor, np.ndarray]],
+-                Optional[Union[torch.Tensor, np.ndarray]],
+-                int,
+-                bool,
+-            ],
+-            torch.Tensor,
+-        ],
+-        num_posterior_samples: int = 100,
+-        most_likely_graph: bool = False,
+-        budget: Optional[torch.Tensor] = None,
+-        reference_intervention: Optional[torch.Tensor] = None,
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        """Computes optimal actions to maximise the objective function under the posterior, subject to a budget.
+-
+-        The `intervention_idxs` should index binary features. The `budget` is a tensor of the same length as
+-        `intervention_idxs` indicating the maximum number of times each treatment can be applied.
+-        If `budget` is `None`, then we solve an unconstrained problem.
+-
+-        The optimisation problem we solve is
+-
+-            max_{a₁, ..., aₙ} Σᵢ E[objective_function(X, aᵢ, reference_intervention, graph)]
+-            subject to Σᵢ 1(aᵢⱼ = 1) ≤ budgetⱼ for each j in intervention_idxs
+-                        Σⱼ 1(aᵢⱼ = 1) ≤ 1 for each i
+-
+-        We return both the optimised values and optimised intervention actions.
+-
+-        To run this function using ITE as an objective function, set
+-
+-            objective_function = lambda *args: model.ite(*args)[0][target_col, ...]
+-
+-        Args:
+-            X: tensor of shape (num_samples, processed_dim_all) containing the contexts that we wish to obtain the optimal action for
+-            intervention_idxs: tensor of shape (num_interventions) containing indices of groups that will be considered as actionable intervention.
+-                These must reference groups consisting solely of binary variables.
+-            objective_function: a function from batches of shape (batch, processed_dim_all) to objective outcomes of shape (batch).
+-                The objective function can incorporate counterfactual calculation or CATE samples conditional on the provided graph.
+-                It may also consume an optional `reference_intervention` for use calculating CATE/ITE.
+-                The arguments to the function are expected to be: `X`, `intervention_idxs`, `intervention_values`, `reference_values`,
+-                `num_posterior_samples`, `most_likely_graph`. Thus, `model.ite` can be used directly as an objective function.
+-            num_posterior_samples: the number of samples of the graph posterior to sample when estimating expectations.
+-            most_likely_graph: whether to use only the most likely graph (deterministic). This requires `num_posterior_samples=1`.
+-            budget: a tensor of shape (num_interventions) of budget constraints. The budget indicates the maximum number of times each treatment
+-                can be applied. If `None`, an unconstrained problem is solved.
+-
+-        Returns:
+-            optimal_actions: tensor of shape (num_samples, processed_dim_actions) containing the optimal actions
+-            optimal_values: tensor of shape (num_samples) containing the posterior expected values attained by applying the specified
+-                actions
+-        """
+-        # Convert groups to variables
+-        intervention_variables = [j for i in intervention_idxs for j in self.variables.group_idxs[i]]
+-        # Check actions are binary
+-        assert all(
+-            self.variables[i].type_ == "binary" for i in intervention_variables
+-        ), "This method only supports binary treatments."
+-
+-        # Calculate outcome matrix of doing each action to each partner
+-        num_interventions = len(intervention_variables)
+-        one_hots = torch.nn.functional.one_hot(torch.arange(num_interventions), num_interventions).unbind(0)
+-        objective_values_list = [
+-            objective_function(
+-                X,
+-                intervention_idxs,
+-                one_hot,
+-                reference_intervention,
+-                num_posterior_samples,
+-                most_likely_graph,
+-            )
+-            for one_hot in one_hots
+-        ]
+-
+-        # Solve with scipy
+-        objective_matrix = np.stack(objective_values_list, axis=-1)
+-        assignments, _ = col_row_constrained_lin_prog(objective_matrix, budget.numpy() if budget else None)
+-        optimal_values = np.sum(assignments * objective_matrix, axis=1)
+-
+-        return assignments, optimal_values
+-
+-
+-# Auxiliary method that logs training metrics to AML and tensorboard
+-def _log_epoch_metrics(
+-    writer: SummaryWriter,
+-    tracker_loss_terms: dict,
+-    adj_metrics: Optional[dict],
+-    step: int,
+-    epoch_time: float,
+-    base_idx: int = 0,
+-):
+-    """
+-    Logging method for DECI training loop
+-    Args:
+-        writer: tensorboard summarywriter used to log experiment results
+-        tracker_loss_terms: dictionary containing arrays with values generated at each inner-step during the inner optimisation procedure
+-        adj_metrics: Optional dictionary with adjacency matrix discovery metrics
+-        step: outer step number
+-        epoch_time: time it took to perform outer step,
+-        base_idx: cummulative inner step number
+-    """
+-
+-    # iterate over tracker vectors
+-    advance_base_idx = 0
+-    for key, value_list in tracker_loss_terms.items():
+-        mlflow.log_metric(f"step_mean_{key}", np.mean(value_list), step=step)
++            
++            if outer_step_start_time!=None:
++                outer_step_time = time.time() - outer_step_start_time
++                print("Time taken for this epoch", outer_step_time)
++            
++            outer_step_start_time = time.time()
++            # adjust_learning_rate
++            lr = base_lr *(0.5 ** ((step - 1) // 1))
++            for param_group in self.opt.param_groups:
++                param_group['lr'] = lr
++        self.save()
+ 
+-        for i, value in enumerate(value_list):
+-            writer.add_scalar(f"step_{step}_{key}", value, i)  # tensorboard
+-            writer.add_scalar(key, value, i + base_idx)  # tensorboard
+-        advance_base_idx = len(value_list)
+ 
+-    base_idx += advance_base_idx  # should only happen once
+ 
+-    # Log time
+-    mlflow.log_metric("step_time", epoch_time, step=step)
+-    writer.add_scalar("step_time", epoch_time, step)
+ 
+-    # log adjacency matrix metrics
+-    if adj_metrics is not None:
+-        for key, value in adj_metrics.items():
+-            writer.add_scalar(key + "_mean", np.mean(value), step)  # tensorboard
+-            writer.add_scalar(key + "std", np.std(value), step)  # tensorboard
+ 
+-    return base_idx
+diff --git a/causica/models/deci/generation_functions.py b/causica/models/deci/generation_functions.py
+index e7f0da0..e605a9b 100644
+--- a/causica/models/deci/generation_functions.py
++++ b/causica/models/deci/generation_functions.py
+@@ -5,6 +5,244 @@ from torch import nn
+ 
+ from ...utils.torch_utils import generate_fully_connected
+ 
++from  munch import DefaultMunch
++import torch.nn.functional as F
++import torch.fft
++from .layers.Embed import DataEmbedding, DataEmbedding_wo_pos
++from .layers.Conv_Blocks import Inception_Block_V1
++from .layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer, ConvLayer
++from .layers.SelfAttention_Family import ProbAttention, AttentionLayer
++from .layers.AutoCorrelation import AutoCorrelation, AutoCorrelationLayer
++from .layers.Autoformer_EncDec import (
++    Encoder as AutoEncoder, 
++    Decoder as AutoDecoder, 
++    EncoderLayer  as AutoEncoderLayer, 
++    DecoderLayer as AutoDecoderLayer, 
++    my_Layernorm, 
++    series_decomp)
++from .layers.ETSformer_EncDec import (
++    EncoderLayer as ETSEncoderLayer, 
++    Encoder as ETSEncoder, 
++    DecoderLayer as ETSDecoderLayer, 
++    Decoder as ETSDecoder, 
++    Transform
++)
++
++
++class TemporalFGNNIwithESTformer(nn.Module):
++    """
++    Autoformer is the first method to achieve the series-wise connection,
++    with inherent O(LlogL) complexity
++    Paper link: https://openreview.net/pdf?id=I55UqU-M11y
++    """
++
++    def __init__(self,
++        group_mask: torch.Tensor,
++        lag: int,
++        configs,
++        pre_len:int=1):
++
++        super().__init__()
++        self.seq_len = lag
++        self.pred_len = pre_len
++        self.num_nodes, _ = group_mask.shape
++        configs['pred_len'] = pre_len
++        configs['seq_len'] = lag
++        self.label_len = int(lag/2)
++        configs['label_len'] = int(self.label_len)
++        configs['enc_in'] = self.num_nodes
++        configs['dec_in'] = self.num_nodes
++        configs['c_out'] = self.num_nodes
++        configs = DefaultMunch.fromDict(configs)
++        assert configs.e_layers == configs.d_layers, "Encoder and decoder layers must be equal"
++
++        self.output_attention = configs.output_attention
++
++        # Embedding
++        self.enc_embedding = DataEmbedding(configs.enc_in, configs.d_model, configs.embed, configs.freq,
++                                           configs.dropout)
++
++        # Embedding
++        self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
++                                                  configs.dropout)
++        # Encoder
++        self.encoder = ETSEncoder(
++            [
++                ETSEncoderLayer(
++                    configs.d_model, configs.n_heads, configs.enc_in, configs.seq_len, self.pred_len, configs.top_k,
++                    dim_feedforward=configs.d_ff,
++                    dropout=configs.dropout,
++                    activation=configs.activation,
++                ) for _ in range(configs.e_layers)
++            ]
++        )
++        # Decoder
++        self.decoder = ETSDecoder(
++            [
++                ETSDecoderLayer(
++                    configs.d_model, configs.n_heads, configs.c_out, self.pred_len,
++                    dropout=configs.dropout,
++                ) for _ in range(configs.d_layers)
++            ],
++        )
++        self.transform = Transform(sigma=0.2)
++
++    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
++        if len(X.shape) == 2:
++            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
++        W_total = W_adj.sum(-1) # batch lag nodes
++        W_total = torch.where( W_total > 0, 1, 0)
++        X = X*W_total
++        return self.feed_forward(X)
++
++
++
++    def forecast(self, x_enc, x_dec, x_mark_enc=None, x_mark_dec=None):
++        with torch.no_grad():
++            if self.training:
++                x_enc = self.transform.transform(x_enc)
++        res = self.enc_embedding(x_enc, x_mark_enc)
++        level, growths, seasons = self.encoder(res, x_enc, attn_mask=None)
++
++        growth, season = self.decoder(growths, seasons)
++        preds = level[:, -1:] + growth + season
++        return preds
++
++    def feed_forward(self, x_enc):
++        
++        batch, lag, nodes = x_enc.shape
++        x_dec_ = torch.zeros(batch, self.pred_len, nodes).to(x_enc.device)
++        x_dec = torch.cat([x_enc[:, -self.label_len:], x_dec_],dim=1) 
++        dec_out = self.forecast(x_enc, x_dec)
++        return dec_out[:, -self.pred_len:, :]
++
++
++
++
++
++
++class TemporalFGNNIwithAutoformer(nn.Module):
++    """
++    Autoformer is the first method to achieve the series-wise connection,
++    with inherent O(LlogL) complexity
++    Paper link: https://openreview.net/pdf?id=I55UqU-M11y
++    """
++
++    def __init__(self,
++        group_mask: torch.Tensor,
++        lag: int,
++        configs,
++        pre_len:int=1):
++
++        super().__init__()
++        self.seq_len = lag
++        self.pred_len = pre_len
++        self.num_nodes, _ = group_mask.shape
++        configs['pred_len'] = pre_len
++        configs['seq_len'] = lag
++        self.label_len = int(lag/2)
++        configs['label_len'] = int(self.label_len)
++        configs['enc_in'] = self.num_nodes
++        configs['dec_in'] = self.num_nodes
++        configs['c_out'] = self.num_nodes
++        configs = DefaultMunch.fromDict(configs)
++
++
++        self.output_attention = configs.output_attention
++
++        # Decomp
++        kernel_size = configs.moving_avg
++        self.decomp = series_decomp(kernel_size)
++
++        # Embedding
++        self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
++                                                  configs.dropout)
++        # Encoder
++        self.encoder = AutoEncoder(
++            [
++                AutoEncoderLayer(
++                    AutoCorrelationLayer(
++                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
++                                        output_attention=configs.output_attention),
++                        configs.d_model, configs.n_heads),
++                    configs.d_model,
++                    configs.d_ff,
++                    moving_avg=configs.moving_avg,
++                    dropout=configs.dropout,
++                    activation=configs.activation
++                ) for l in range(configs.e_layers)
++            ],
++            norm_layer=my_Layernorm(configs.d_model)
++        )
++        # Decoder
++        self.dec_embedding = DataEmbedding_wo_pos(configs.dec_in, configs.d_model, configs.embed, configs.freq,
++                                                    configs.dropout)
++        self.decoder = AutoDecoder(
++            [
++                AutoDecoderLayer(
++                    AutoCorrelationLayer(
++                        AutoCorrelation(True, configs.factor, attention_dropout=configs.dropout,
++                                        output_attention=False),
++                        configs.d_model, configs.n_heads),
++                    AutoCorrelationLayer(
++                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
++                                        output_attention=False),
++                        configs.d_model, configs.n_heads),
++                    configs.d_model,
++                    configs.c_out,
++                    configs.d_ff,
++                    moving_avg=configs.moving_avg,
++                    dropout=configs.dropout,
++                    activation=configs.activation,
++                )
++                for l in range(configs.d_layers)
++            ],
++            norm_layer=my_Layernorm(configs.d_model),
++            projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
++        )
++
++    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
++        if len(X.shape) == 2:
++            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
++        W_total = W_adj.sum(-1) # batch lag nodes
++        W_total = torch.where( W_total > 0, 1, 0)
++        X = X*W_total
++        return self.feed_forward(X)
++
++
++    def forecast(self, x_enc,x_dec, x_mark_enc=None, x_mark_dec=None):
++        # decomp init
++        mean = torch.mean(x_enc, dim=1).unsqueeze(
++            1).repeat(1, self.pred_len, 1)
++        zeros = torch.zeros([x_dec.shape[0], self.pred_len,
++                             x_dec.shape[2]], device=x_enc.device)
++        seasonal_init, trend_init = self.decomp(x_enc)
++        # decoder input
++        trend_init = torch.cat(
++            [trend_init[:, -self.label_len:, :], mean], dim=1)
++        seasonal_init = torch.cat(
++            [seasonal_init[:, -self.label_len:, :], zeros], dim=1)
++        # enc
++        enc_out = self.enc_embedding(x_enc, x_mark_enc)
++        enc_out, attns = self.encoder(enc_out, attn_mask=None)
++        # dec
++        dec_out = self.dec_embedding(seasonal_init,  x_mark_dec)
++        seasonal_part, trend_part = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None,
++                                                 trend=trend_init)
++        # final
++        dec_out = trend_part + seasonal_part
++        return dec_out
++
++    def feed_forward(self, x_enc):
++        
++        batch, lag, nodes = x_enc.shape
++        x_dec_ = torch.zeros(batch, self.pred_len, nodes).to(x_enc.device)
++        x_dec = torch.cat([x_enc[:, -self.label_len:], x_dec_],dim=1) 
++        dec_out = self.forecast(x_enc, x_dec)
++        return dec_out[:, -self.pred_len:, :]
++
++
++
+ 
+ class ContractiveInvertibleGNN(nn.Module):
+     """
+@@ -206,9 +444,10 @@ class TemporalContractiveInvertibleGNN(nn.Module):
+         # Directly calling the feed_forward of TemporalFGNNI.
+         # Requirement: self.f.feed_backward(X, W_adj). If W_adj has shape [lag+1, num_nodes, num_nodes], then it is applied for all batches
+         # in X. If W_adj has shape [N_batch, lag+1, num_nodes, num_nodes], then each W_adj[i, ...] is applied for X[i, ...].
++        W_adj = W_adj*self.get_weighted_adjacency().unsqueeze(0)
+         if len(X.shape) == 2:
+             X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
+-        return self.f.feed_forward(X, W_adj).squeeze(0) # batch nodes pre_len
++        return self.f.feed_forward(X, W_adj).squeeze(0).transpose(-1,-2)  # batch  pre_len nodes 
+ 
+     # #change
+     # def simulate_SEM_conditional(
+@@ -660,6 +899,408 @@ class TemporalFGNNI(FGNNI):
+         # X_rec *= self.group_mask  # shape (batch_size, num_nodes, processed_dim_all)
+         return X_rec # shape (batch_size, processed_dim_all, pre_len)
+ 
++def FFT_for_Period(x, k=2):
++    # [B, T, C]
++    xf = torch.fft.rfft(x, dim=1)
++    # find period by amplitudes
++    frequency_list = abs(xf).mean(0).mean(-1)
++    frequency_list[0] = 0
++    _, top_list = torch.topk(frequency_list, k)
++    top_list = top_list.detach().cpu().numpy()
++    period = x.shape[1] // top_list
++    return period, abs(xf).mean(-1)[:, top_list]
++
++
++class TimesBlock(nn.Module):
++    def __init__(self, configs):
++        super(TimesBlock, self).__init__()
++        self.seq_len = configs.seq_len
++        self.pred_len = configs.pred_len
++        self.k = configs.top_k
++        # parameter-efficient design
++        self.conv = nn.Sequential(
++            Inception_Block_V1(configs.d_model, configs.d_ff,
++                               num_kernels=configs.num_kernels),
++            nn.GELU(),
++            Inception_Block_V1(configs.d_ff, configs.d_model,
++                               num_kernels=configs.num_kernels)
++        )
++
++    def forward(self, x):
++        B, T, N = x.size()
++        period_list, period_weight = FFT_for_Period(x, self.k)
++
++        res = []
++        for i in range(self.k):
++            period = period_list[i]
++            # padding
++            if (self.seq_len + self.pred_len) % period != 0:
++                length = (
++                                 ((self.seq_len + self.pred_len) // period) + 1) * period
++                padding = torch.zeros([x.shape[0], (length - (self.seq_len + self.pred_len)), x.shape[2]]).to(x.device)
++                out = torch.cat([x, padding], dim=1)
++            else:
++                length = (self.seq_len + self.pred_len)
++                out = x
++            # reshape
++            out = out.reshape(B, length // period, period,
++                              N).permute(0, 3, 1, 2).contiguous()
++            # 2D conv: from 1d Variation to 2d Variation
++            out = self.conv(out)
++            # reshape back
++            out = out.permute(0, 2, 3, 1).reshape(B, -1, N)
++            res.append(out[:, :(self.seq_len + self.pred_len), :])
++        res = torch.stack(res, dim=-1)
++        # adaptive aggregation
++        period_weight = F.softmax(period_weight, dim=1)
++        period_weight = period_weight.unsqueeze(
++            1).unsqueeze(1).repeat(1, T, N, 1)
++        res = torch.sum(res * period_weight, -1)
++        # residual connection
++        res = res + x
++        return res
++
++
++class TemporalFGNNIwithTimesNet(nn.Module):
++    """
++    This defines the temporal version of FGNNI, which supports temporal adjacency matrix. The main difference is the modification of
++    the feed_forward method, which generates the predictions based on the given parents (simultantanous + lagged). Additionally,
++    we also need to override the method initialize_embeddings() in FunctionSEM so that it is consistent with the temporal data format.
++
++    For now, since we use ANM for both simultaneous and lagged effect, we share the network parameters, and they only differ by the input embeddings.
++    """
++
++    def __init__(
++        self,
++        group_mask: torch.Tensor,
++        lag: int,
++        configs,
++        pre_len:int=1
++    ):
++        """
++        This initalize the temporal version of FGNNI.
++
++        Args:
++            group_mask: A mask of shape (num_nodes, num_processed_cols) such that group_mask[i, j] = 1 when col j is in group i.
++            device: The device to use.
++            lag: The lag for the model, should be >0.
++            embedding_size: The embedding size to use. Thus, the generated embeddings will be of shape [lag+1, num_nodes, embedding_size].
++            out_dim_g: The output dimension of the g function.
++            norm_layer: The normalization layer to use.
++            res_connection: Whether to use residual connection.
++            layers_g: The hidden layers of the g function.
++            layers_f: The hidden layers of the f function.
++        """
++        self.lag = lag
++        self.pre_len = pre_len
++        self.num_nodes, _ = group_mask.shape
++        configs['pred_len'] = pre_len
++        configs['seq_len'] = lag
++        configs = DefaultMunch.fromDict(configs)
++        # Call init of the parent class. Note that we need to overwrite the initialize_embeddings() method so that
++        # it is consistent with the temporal data format.
++        super().__init__()
++        self.model = nn.ModuleList([TimesBlock(configs)
++                                    for _ in range(configs.e_layers)])
++        self.enc_embedding = DataEmbedding(self.num_nodes, configs.d_model, configs.embed, configs.freq,
++                                           configs.dropout)
++        self.layer = configs.e_layers
++        self.layer_norm = nn.LayerNorm(configs.d_model)
++        # if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
++        self.predict_linear = nn.Linear(
++            self.lag, self.lag+self.pre_len)
++        self.projection = nn.Linear(
++            configs.d_model, self.num_nodes, bias=True)
++        # if self.task_name == 'imputation' or self.task_name == 'anomaly_detection':
++        #     self.projection = nn.Linear(
++        #         configs.d_model, configs.c_out, bias=True)
++        # if self.task_name == 'classification':
++        #     self.act = F.gelu
++        #     self.dropout = nn.Dropout(configs.dropout)
++        #     self.projection = nn.Linear(
++        #         configs.d_model * configs.seq_len, configs.num_class)
++    
++    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
++        if len(X.shape) == 2:
++            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
++        return self.feed_forward(X, W_adj)
++
++
++    def feed_forward(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
++        """
++        This method overwrites the one in FGNNI and computes the SEM children = f(parents) specified by the temporal W_adj. The implementation strategy is similar to
++        the static version.
++        Args:
++            X: Data from data loader with shape [batch_size, lag+1, processed_dim_all].
++            W_adj: The temporal adjacency matrix with shape [lag+1, num_nodes, num_nodes] or [batch_size, lag+1, num_nodes, num_nodes].
++        """
++
++        # Assert tht if W_adj has batch dimension and >1 and X.shape[0]>1, then W_adj.shape[0] must match X.shape[0].
++        # Assert X must have batch dimension.
++        # Expand the weighted adjacency matrix dims for later matmul operation.
++        if len(W_adj.shape) == 3:
++            W_adj = W_adj.unsqueeze(0)  # shape (1, lag+1, num_nodes, num_nodes)
++        assert len(X.shape) == 3, "The shape of X must be [batch, lag, proc_dim]"
++        assert (
++            W_adj.shape[1] == X.shape[1]
++        ), f"The lag of W_adj ({W_adj.shape[1]}) is inconsistent to the lag of X ({X.shape[1]})"
++        assert (
++            W_adj.shape[0] == 1 or W_adj.shape[0] == X.shape[0]
++        ), "The batch size of W_adj is inconsistent with X batch size"
++
++        # For network g input, we mask the input with group mask, and concatenate it with the node embeddings.
++        # Transform through g function. Output has shape shape (batch_size, lag+1, num_nodes, out_dim_g)
++        #   X shape (batch_size, lag, self.nodes)
++        #   W shape batch, lag nodes nodes
++        W_total = W_adj.sum(-1) # batch lag nodes
++        W_total = torch.where( W_total > 0, 1, 0)
++        X = X*W_total
++        dec_out = self.forecast(X)
++
++        # Masked the output with group_mask, followed by summation num_nodes to get correct node values.
++        # output has shape (batch_size, processed_dim_all)
++        # X_rec *= self.group_mask  # shape (batch_size, num_nodes, processed_dim_all)
++        return dec_out # shape (batch_size, pre_len, processed_dim_all, pre_len)
++
++    def forecast(self, x_enc, x_mark_enc=None):
++        # Normalization from Non-stationary Transformer
++        means = x_enc.mean(1, keepdim=True).detach()
++        x_enc = x_enc - means
++        stdev = torch.sqrt(
++            torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
++        x_enc /= stdev
++
++        # embedding
++        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
++        enc_out = self.predict_linear(enc_out.permute(0, 2, 1)).permute(
++            0, 2, 1)  # align temporal dimension
++        # TimesNet
++        for i in range(self.layer):
++            enc_out = self.layer_norm(self.model[i](enc_out))
++        # porject back
++        dec_out = self.projection(enc_out)
++
++        # De-Normalization from Non-stationary Transformer
++        dec_out = dec_out * \
++                  (stdev[:, 0, :].unsqueeze(1).repeat(
++                      1, self.pre_len + self.lag, 1))
++        dec_out = dec_out + \
++                  (means[:, 0, :].unsqueeze(1).repeat(
++                      1, self.pre_len + self.lag, 1))
++        return dec_out[:, -self.pre_len:,]#batch pre_len nodes
++
++    def imputation(self, x_enc, x_mark_enc, mask):
++        # Normalization from Non-stationary Transformer
++        means = torch.sum(x_enc, dim=1) / torch.sum(mask == 1, dim=1)
++        means = means.unsqueeze(1).detach()
++        x_enc = x_enc - means
++        x_enc = x_enc.masked_fill(mask == 0, 0)
++        stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=1) /
++                           torch.sum(mask == 1, dim=1) + 1e-5)
++        stdev = stdev.unsqueeze(1).detach()
++        x_enc /= stdev
++
++        # embedding
++        enc_out = self.enc_embedding(x_enc, x_mark_enc)  # [B,T,C]
++        # TimesNet
++        for i in range(self.layer):
++            enc_out = self.layer_norm(self.model[i](enc_out))
++        # porject back
++        dec_out = self.projection(enc_out)
++
++        # De-Normalization from Non-stationary Transformer
++        dec_out = dec_out * \
++                  (stdev[:, 0, :].unsqueeze(1).repeat(
++                      1, self.pred_len + self.seq_len, 1))
++        dec_out = dec_out + \
++                  (means[:, 0, :].unsqueeze(1).repeat(
++                      1, self.pred_len + self.seq_len, 1))
++        return dec_out
++
++    def anomaly_detection(self, x_enc):
++        # Normalization from Non-stationary Transformer
++        means = x_enc.mean(1, keepdim=True).detach()
++        x_enc = x_enc - means
++        stdev = torch.sqrt(
++            torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
++        x_enc /= stdev
++
++        # embedding
++        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
++        # TimesNet
++        for i in range(self.layer):
++            enc_out = self.layer_norm(self.model[i](enc_out))
++        # porject back
++        dec_out = self.projection(enc_out)
++
++        # De-Normalization from Non-stationary Transformer
++        dec_out = dec_out * \
++                  (stdev[:, 0, :].unsqueeze(1).repeat(
++                      1, self.pred_len + self.seq_len, 1))
++        dec_out = dec_out + \
++                  (means[:, 0, :].unsqueeze(1).repeat(
++                      1, self.pred_len + self.seq_len, 1))
++        return dec_out
++
++    def classification(self, x_enc, x_mark_enc):
++        # embedding
++        enc_out = self.enc_embedding(x_enc, None)  # [B,T,C]
++        # TimesNet
++        for i in range(self.layer):
++            enc_out = self.layer_norm(self.model[i](enc_out))
++
++        # Output
++        # the output transformer encoder/decoder embeddings don't include non-linearity
++        output = self.act(enc_out)
++        output = self.dropout(output)
++        # zero-out padding embeddings
++        output = output * x_mark_enc.unsqueeze(-1)
++        # (batch_size, seq_length * d_model)
++        output = output.reshape(output.shape[0], -1)
++        output = self.projection(output)  # (batch_size, num_classes)
++        return output
++
++
++class TemporalFGNNIwithInformer(nn.Module):
++    """
++    This defines the temporal version of FGNNI, which supports temporal adjacency matrix. The main difference is the modification of
++    the feed_forward method, which generates the predictions based on the given parents (simultantanous + lagged). Additionally,
++    we also need to override the method initialize_embeddings() in FunctionSEM so that it is consistent with the temporal data format.
++
++    For now, since we use ANM for both simultaneous and lagged effect, we share the network parameters, and they only differ by the input embeddings.
++    """
++
++    def __init__(
++        self,
++        group_mask: torch.Tensor,
++        lag: int,
++        configs,
++        pre_len:int=1
++    ):
++        """
++        This initalize the temporal version of FGNNI.
++
++        Args:
++            group_mask: A mask of shape (num_nodes, num_processed_cols) such that group_mask[i, j] = 1 when col j is in group i.
++            device: The device to use.
++            lag: The lag for the model, should be >0.
++            embedding_size: The embedding size to use. Thus, the generated embeddings will be of shape [lag+1, num_nodes, embedding_size].
++            out_dim_g: The output dimension of the g function.
++            norm_layer: The normalization layer to use.
++            res_connection: Whether to use residual connection.
++            layers_g: The hidden layers of the g function.
++            layers_f: The hidden layers of the f function.
++        """
++
++        self.lag = lag
++        self.pre_len = pre_len
++        self.num_nodes, _ = group_mask.shape
++        configs['pred_len'] = pre_len
++        configs['seq_len'] = lag
++        self.label_len = int(lag/2)
++        configs['label_len'] = int(self.label_len)
++        configs = DefaultMunch.fromDict(configs)
++        # Call init of the parent class. Note that we need to overwrite the initialize_embeddings() method so that
++        # it is consistent with the temporal data format.
++        super().__init__()
++
++        
++        # Embedding
++        self.enc_embedding = DataEmbedding(self.num_nodes, configs.d_model, configs.embed, configs.freq,
++                                           configs.dropout)
++        self.dec_embedding = DataEmbedding(self.num_nodes, configs.d_model, configs.embed, configs.freq,
++                                           configs.dropout)
++
++        # Encoder
++        self.encoder = Encoder(
++            [
++                EncoderLayer(
++                    AttentionLayer(
++                        ProbAttention(False, configs.factor, attention_dropout=configs.dropout,
++                                      output_attention=configs.output_attention),
++                        configs.d_model, configs.n_heads),
++                    configs.d_model,
++                    configs.d_ff,
++                    dropout=configs.dropout,
++                    activation=configs.activation
++                ) for l in range(configs.e_layers)
++            ],
++            # [
++            #     ConvLayer(
++            #         configs.d_model
++            #     ) for l in range(configs.e_layers - 1)
++            # ] if configs.distil and ('forecast' in configs.task_name) else None,
++            norm_layer=torch.nn.LayerNorm(configs.d_model)
++        )
++        # Decoder
++        self.decoder = Decoder(
++            [
++                DecoderLayer(
++                    AttentionLayer(
++                        ProbAttention(True, configs.factor, attention_dropout=configs.dropout, output_attention=False),
++                        configs.d_model, configs.n_heads),
++                    AttentionLayer(
++                        ProbAttention(False, configs.factor, attention_dropout=configs.dropout, output_attention=False),
++                        configs.d_model, configs.n_heads),
++                    configs.d_model,
++                    configs.d_ff,
++                    dropout=configs.dropout,
++                    activation=configs.activation,
++                )
++                for l in range(configs.d_layers)
++            ],
++            norm_layer=torch.nn.LayerNorm(configs.d_model),
++            projection=nn.Linear(configs.d_model, self.num_nodes, bias=True)
++        )
++        
++    def predict(self, X: torch.Tensor, W_adj: torch.Tensor) -> torch.Tensor:
++        if len(X.shape) == 2:
++            X = X.unsqueeze(0)  # [1, lag, processed_dim_all]
++        W_total = W_adj.sum(-1) # batch lag nodes
++        W_total = torch.where( W_total > 0, 1, 0)
++        X = X*W_total
++        return self.feed_forward(X)
++
++    
++   
++    def long_forecast(self, x_enc,  x_dec,  x_mark_enc=None):
++        enc_out = self.enc_embedding(x_enc, x_mark_enc)
++        dec_out = self.dec_embedding(x_dec, x_mark_enc)
++        enc_out, attns = self.encoder(enc_out, attn_mask=None)
++
++        dec_out = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None)
++
++        return dec_out  # [B, L, D]
++    
++    def short_forecast(self, x_enc, x_dec,  x_mark_enc=None):
++        # Normalization
++        mean_enc = x_enc.mean(1, keepdim=True).detach()  # B x 1 x E
++        x_enc = x_enc - mean_enc
++        std_enc = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()  # B x 1 x E
++        x_enc = x_enc / std_enc
++        
++
++        enc_out = self.enc_embedding(x_enc, x_mark_enc)
++        dec_out = self.dec_embedding(x_dec, x_mark_enc)
++        enc_out, attns = self.encoder(enc_out, attn_mask=None)
++
++        dec_out = self.decoder(dec_out, enc_out, x_mask=None, cross_mask=None)
++
++        dec_out = dec_out * std_enc + mean_enc
++        return dec_out  # [B, L, D]
++
++    def feed_forward(self, x_enc):
++        batch, lag, nodes = x_enc.shape
++        x_dec_ = torch.zeros(batch, self.pre_len, nodes).to(x_enc.device)
++        x_dec = torch.cat([x_enc[:, -self.label_len:], x_dec_],dim=1)  # B l+p D
++        # if self.task_name == 'long_term_forecast':
++        dec_out = self.long_forecast(x_enc, x_dec)
++        return dec_out[:, -self.pre_len:, :]  # [B, L, D]
++        # if self.task_name == 'short_term_forecast':
++        #     dec_out = self.short_forecast(x_enc,  x_dec, x_mask)
++        #     return dec_out[:, -self.pred_len:, :]  # [B, L, D]
++        
++
+ 
+ class TemporalHyperNet(nn.Module):
+     """
+@@ -751,15 +1392,15 @@ class TemporalHyperNet(nn.Module):
+             res_connection=res_connection,
+         )
+         # Initialize the associated weights by calling self.W = self._initialize_W(). self.W has shape [lag+1, num_nodes, num_nodes]
+-        self.W = self._initialize_W() #[lag, num_nodes, num_nodes]
++        # self.W = self._initialize_W() #[lag, num_nodes, num_nodes]
+ 
+-    def _initialize_W(self) -> torch.Tensor:
+-        """
+-        Initializes the associated weight with shape [lag, num_nodes, num_nodes]. Currently, initialize to zero.
+-        Returns: the initialized weight with shape [lag, num_nodes, num_nodes]
+-        """
+-        W = torch.zeros(self.lag , self.num_nodes, self.num_nodes, device=self.device)
+-        return nn.Parameter(W, requires_grad=True)
++    # def _initialize_W(self) -> torch.Tensor:
++    #     """
++    #     Initializes the associated weight with shape [lag, num_nodes, num_nodes]. Currently, initialize to zero.
++    #     Returns: the initialized weight with shape [lag, num_nodes, num_nodes]
++    #     """
++    #     W = torch.zeros(self.lag , self.num_nodes, self.num_nodes, device=self.device)
++    #     return nn.Parameter(W, requires_grad=True)
+     
+     def initialize_embeddings(self) -> torch.Tensor:
+         """
+@@ -793,7 +1434,7 @@ class TemporalHyperNet(nn.Module):
+         assert W.dim() == 4, "W must have shape [batch, lag+1, num_node, num_node]"
+ 
+         # assert lag
+-        assert X_hist.shape[1] == W.shape[1] - 1, "The input observation should be the history observation."
++        assert X_hist.shape[1] == W.shape[1], "The input observation should be the history observation."
+         X_hist = X_hist.unsqueeze(-2)  # [batch, lag, 1, proc_dim]
+         X_hist_masked = X_hist * self.group_mask  # [batch, lag, node, proc_dim]
+         E = self.embeddings.expand(
+@@ -805,13 +1446,13 @@ class TemporalHyperNet(nn.Module):
+             [X_hist_masked, E_lag], dim=-1
+         )  # shape (batch_size, lag, num_nodes, embedding_size+proc_dim)
+         X_emb = self.g(X_in_g)  # shape (batch_size, lag, num_nodes, out_dim_g)
+-        W_lag_exp = W[:, 1:, :, :]  # shape [batch, lag, node, node]
++
+         
+-        # # change  add weight
+-        W_lag_exp = W_lag_exp*self.W.unsqueeze(0)
++        # # # change  add weight
++        # W_lag_exp = W_lag_exp*self.W.unsqueeze(0)
+ 
+         X_aggr_sum = torch.einsum(
+-            "klij,klio->kjo", W_lag_exp.flip([1]), X_emb
++            "klij,klio->kjo", W.flip([1]), X_emb
+         )  # shape (batch_size, num_nodes, out_dim_g)
+ 
+         X_in_f = torch.cat([X_aggr_sum, E_inst], dim=-1)  # shape (batch_size, num_nodes, embedding_size+out_dim_g)
+diff --git a/causica/models/deci/layers/SelfAttention_Family.py b/causica/models/deci/layers/SelfAttention_Family.py
+index fa58a28..ef42a0f 100644
+--- a/causica/models/deci/layers/SelfAttention_Family.py
++++ b/causica/models/deci/layers/SelfAttention_Family.py
+@@ -2,7 +2,7 @@ import torch
+ import torch.nn as nn
+ import numpy as np
+ from math import sqrt
+-from utils.masking import TriangularCausalMask, ProbMask
++from ..utils.masking import TriangularCausalMask, ProbMask
+ from reformer_pytorch import LSHSelfAttention
+ from einops import rearrange, repeat
+ 
+diff --git a/causica/models/deci/rhino.py b/causica/models/deci/rhino.py
+index 95d63ec..086c527 100644
+--- a/causica/models/deci/rhino.py
++++ b/causica/models/deci/rhino.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ 
+ import os
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+-
++from collections import defaultdict
+ import networkx as nx
+ import numpy as np
+ import scipy
+@@ -22,14 +22,24 @@ from ...utils.causality_utils import (
+ )
+ from ...utils.helper_functions import to_tensors
+ from ...utils.nri_utils import convert_temporal_to_static_adjacency_matrix, edge_prediction_metrics_multisample
+-from ..imodel import IModelForTimeseries
+-from .base_distributions import TemporalConditionalSplineFlow
+-from .deci import DECI
+-from .generation_functions import TemporalContractiveInvertibleGNN, TemporalFGNNIwithTimesNet
++from ..imodel import (
++    IModelForTimeseries,
++)
++from ...models.torch_model import TorchModel
++from .base_distributions import (
++    BinaryLikelihood,
++    CategoricalLikelihood,
++    DiagonalFlowBase,
++    GaussianBase,
++    TemporalConditionalSplineFlow,
++)
++from .generation_functions import TemporalContractiveInvertibleGNN, TemporalFGNNIwithTimesNet, TemporalFGNNIwithInformer,TemporalFGNNIwithAutoformer, TemporalFGNNIwithESTformer
+ from .variational_distributions import AdjMatrix, TemporalThreeWayGrahpDist
+ from sklearn.preprocessing import StandardScaler
++from ...preprocessing.data_processor import DataProcessor
++import time
+ 
+-class Rhino(DECI, IModelForTimeseries):
++class Rhino(TorchModel,IModelForTimeseries):
+     """
+     This class implements the AR-DECI model for end-to-end time series causal inference. It is inherited from the DECI class.
+     One of the principle is to re-use as many code from the DECI as possible to avoid code repetition. For an overview of the design and
+@@ -46,7 +56,6 @@ class Rhino(DECI, IModelForTimeseries):
+         device: torch.device,
+         lag: int,
+         pre_len: int,
+-        configs:Dict,
+         allow_instantaneous: bool,
+         imputation: bool = False,
+         lambda_dag: float = 1.0,
+@@ -65,7 +74,9 @@ class Rhino(DECI, IModelForTimeseries):
+             0.1,
+             1.0,
+         ),
++        prior_A: Union[torch.Tensor, np.ndarray] = None,
+         prior_A_confidence: float = 0.5,
++        prior_mask: Union[torch.Tensor, np.ndarray] = None,
+         graph_constraint_matrix: Optional[np.ndarray] = None,
+         ICGNN_embedding_size: Optional[int] = None,
+         init_logits: Optional[List[float]] = None,
+@@ -75,6 +86,11 @@ class Rhino(DECI, IModelForTimeseries):
+         conditional_spline_order: str = "quadratic",
+         additional_spline_flow: int = 0,
+         disable_diagonal_eval: bool = True,
++        configs: Optional[Dict] = None,
++        log_scale_init: float =  -0.0,
++        dense_init: bool = False,
++        mode_adjacency: str = "learn",
++
+     ):
+         """
+         Initialize the Rhino. Most of the parameters are from DECI class. For initialization, we first initialize the DECI class, and then
+@@ -102,11 +118,13 @@ class Rhino(DECI, IModelForTimeseries):
+         # Thus, the prior matrix will be set in run_train(), where datasest is one of the input. Here, we use None for prior_A.
+         # For variational distribution and ICGNN, we overwrite the self._create_variational_distribution(...) and self._create_ICGNN(...)
+         # to generate the correct type of var_dist and ICGNN.
+-
++        self.mode_adjacency = mode_adjacency
+         # Note that we may want to check if variables are all continuous.
+         self.allow_instantaneous = allow_instantaneous
+         self.init_logits = init_logits
+         self.lag = lag
++        self.configs = configs
++
+         self.cts_node = variables.continuous_idxs
+         self.cts_dim = len(self.cts_node)
+         # conditional spline flow hyper-params.
+@@ -115,38 +133,61 @@ class Rhino(DECI, IModelForTimeseries):
+         self.conditional_decoder_layer_sizes = conditional_decoder_layer_sizes
+         self.conditional_spline_order = conditional_spline_order
+         self.additional_spline_flow = additional_spline_flow
+-        self.configs = configs
++
+         
+         # For V0 AR-DECI, we only support mode_adjacency="learn", so hardcoded this argument.
+-        super().__init__(
+-            model_id=model_id,
+-            variables=variables,
+-            save_dir=save_dir,
+-            device=device,
+-            imputation=imputation,
+-            lambda_dag=lambda_dag,
+-            lambda_sparse=lambda_sparse,
+-            lambda_prior=lambda_prior,
+-            tau_gumbel=tau_gumbel,
+-            base_distribution_type=base_distribution_type,
+-            spline_bins=spline_bins,
+-            var_dist_A_mode=var_dist_A_mode,
+-            imputer_layer_sizes=None,
+-            mode_adjacency="learn",
+-            norm_layers=norm_layers,
+-            res_connection=res_connection,
+-            encoder_layer_sizes=encoder_layer_sizes,
+-            decoder_layer_sizes=decoder_layer_sizes,
+-            cate_rff_n_features=cate_rff_n_features,
+-            cate_rff_lengthscale=cate_rff_lengthscale,
+-            prior_A=None,
+-            prior_A_confidence=prior_A_confidence,
+-            prior_mask=None,
+-            graph_constraint_matrix=graph_constraint_matrix,
+-            embedding_size=ICGNN_embedding_size,
+-            disable_diagonal_eval=disable_diagonal_eval,
+-            pre_len=pre_len
+-        )
++        super().__init__(model_id, variables, save_dir, device)
++        self.disable_diagonal_eval = disable_diagonal_eval
++
++        self.base_distribution_type = base_distribution_type
++        self.dense_init = dense_init
++        self.embedding_size = ICGNN_embedding_size
++        self.device = device
++        self.lambda_dag = lambda_dag
++        self.lambda_sparse = lambda_sparse
++        self.lambda_prior = lambda_prior
++        self.log_scale_init = log_scale_init
++
++        self.cate_rff_n_features = cate_rff_n_features
++        self.cate_rff_lengthscale = cate_rff_lengthscale
++        self.tau_gumbel = tau_gumbel
++        self.encoder_layer_sizes = encoder_layer_sizes
++        self.decoder_layer_sizes = decoder_layer_sizes
++
++        # DECI treats *groups* as distinct nodes in the graph
++        self.num_nodes = variables.num_groups
++        self.processed_dim_all = variables.num_processed_non_aux_cols
++
++        # set up soft prior over graphs
++        self.set_prior_A(prior_A, prior_mask)
++        assert 0 <= prior_A_confidence <= 1
++        self.prior_A_confidence = prior_A_confidence
++
++        # Set up the Neural Nets
++        self.res_connection = res_connection
++        self.norm_layer = nn.LayerNorm if norm_layers else None
++        self.pre_len = pre_len
++        self.ICGNN = self._create_ICGNN_for_deci()
++
++        self.spline_bins = spline_bins
++        self.likelihoods = nn.ModuleDict(self._generate_error_likelihoods(self.base_distribution_type, self.variables))
++
++        self.variables = variables
++
++        self.imputation = imputation
++        if self.imputation:
++            self.all_cts = all(var.type_ == "continuous" for var in variables)
++            imputation_input_dim = 2 * self.processed_dim_all
++            imputation_output_dim = 2 * self.processed_dim_all
++            imputer_layer_sizes = imputer_layer_sizes or [max(80, imputation_input_dim)] * 2
++
++        self.var_dist_A = self._create_var_dist_A_for_deci(var_dist_A_mode)
++
++        # Adding a buffer to hold the log likelihood. This will be saved with the state dict.
++        self.register_buffer("log_p_x", torch.tensor(-np.inf))
++        self.log_p_x: torch.Tensor  # This is simply a scalar.
++        self.register_buffer("spline_mean_ewma", torch.tensor(0.0))
++        self.spline_mean_ewma: torch.Tensor
+ 
+     def _generate_error_likelihoods(self, base_distribution_string: str, variables: Variables) -> Dict[str, nn.Module]:
+         """
+@@ -159,24 +200,64 @@ class Rhino(DECI, IModelForTimeseries):
+         Returns:
+             error_likelihood dict
+         """
+-        error_likelihoods = super()._generate_error_likelihoods(
+-            base_distribution_string if base_distribution_string != "conditional_spline" else "spline",
+-            variables,
+-        )
++        base_distribution_string if base_distribution_string != "conditional_spline" else "spline",
+ 
+-        if base_distribution_string == "conditional_spline":
+-            error_likelihoods["continuous"] = TemporalConditionalSplineFlow(
+-                cts_node=self.cts_node,
+-                group_mask=torch.tensor(self.variables.group_mask).to(self.device),
+-                device=self.device,
+-                lag=self.lag,
+-                num_bins=self.spline_bins,
+-                additional_flow=self.additional_spline_flow,
+-                layers_g=self.conditional_encoder_layer_sizes,
+-                layers_f=self.conditional_decoder_layer_sizes,
+-                embedding_size=self.conditional_embedding_size,
+-                order=self.conditional_spline_order,
++        error_likelihoods: Dict[str, nn.Module] = {}
++        typed_regions = variables.processed_cols_by_type
++        # Continuous
++        continuous_range = [i for region in typed_regions["continuous"] for i in region]
++        if continuous_range:
++            dist: nn.Module
++            if base_distribution_string == "fixed_gaussian":
++                dist = GaussianBase(
++                    len(continuous_range),
++                    device=self.device,
++                    train_base=False,
++                    log_scale_init=self.log_scale_init,
++                )
++            elif base_distribution_string == "gaussian":
++                dist = GaussianBase(
++                    len(continuous_range),
++                    device=self.device,
++                    train_base=True,
++                    log_scale_init=self.log_scale_init,
++                )
++            elif base_distribution_string == "spline":
++                dist = DiagonalFlowBase(
++                    len(continuous_range),
++                    device=self.device,
++                    num_bins=self.spline_bins,
++                    flow_steps=1,
++                )
++            elif base_distribution_string == "conditional_spline":
++                dist = TemporalConditionalSplineFlow(
++                    cts_node=self.cts_node,
++                    group_mask=torch.tensor(self.variables.group_mask).to(self.device),
++                    device=self.device,
++                    lag=self.lag,
++                    num_bins=self.spline_bins,
++                    additional_flow=self.additional_spline_flow,
++                    layers_g=self.conditional_encoder_layer_sizes,
++                    layers_f=self.conditional_decoder_layer_sizes,
++                    embedding_size=self.conditional_embedding_size,
++                    order=self.conditional_spline_order,
++                )
++            else:
++                raise NotImplementedError("Base distribution type not recognised")
++            error_likelihoods["continuous"] = dist
++
++        # Binary
++        binary_range = [i for region in typed_regions["binary"] for i in region]
++        if binary_range:
++            error_likelihoods["binary"] = BinaryLikelihood(len(binary_range), device=self.device)
++
++        # Categorical
++        if "categorical" in typed_regions:
++            error_likelihoods["categorical"] = nn.ModuleList(
++                [CategoricalLikelihood(len(region), device=self.device) for region in typed_regions["categorical"]]
+             )
++
++
+         return error_likelihoods
+ 
+     def _create_var_dist_A_for_deci(self, var_dist_A_mode: str) -> Optional[AdjMatrix]:
+@@ -224,13 +305,35 @@ class Rhino(DECI, IModelForTimeseries):
+         #     embedding_size=self.embedding_size,
+         #     pre_len=self.pre_len
+         # )
+-
+-        return TemporalFGNNIwithTimesNet(
++        #timesnet
++        # return TemporalFGNNIwithTimesNet(
++        #     group_mask=torch.tensor(self.variables.group_mask),
++        #     lag=self.lag,
++        #     configs= self.configs,
++        #     pre_len = self.pre_len
++        # ).to(self.device)
++        #informer
++        return TemporalFGNNIwithInformer(
+             group_mask=torch.tensor(self.variables.group_mask),
+             lag=self.lag,
+             configs= self.configs,
+             pre_len = self.pre_len
+         ).to(self.device)
++        # autoformer
++        # return TemporalFGNNIwithAutoformer(
++        #     group_mask=torch.tensor(self.variables.group_mask),
++        #     lag=self.lag,
++        #     configs= self.configs,
++        #     pre_len = self.pre_len
++        # ).to(self.device)
++        #ESTformer
++        # return TemporalFGNNIwithESTformer(
++        #     group_mask=torch.tensor(self.variables.group_mask),
++        #     lag=self.lag,
++        #     configs= self.configs,
++        #     pre_len = self.pre_len
++        # ).to(self.device)
++ 
+     
+     def networkx_graph(self) -> nx.DiGraph:
+         """
+@@ -275,30 +378,6 @@ class Rhino(DECI, IModelForTimeseries):
+     def name(cls) -> str:
+         return "rhino"
+ 
+-    def set_graph_constraint(self, graph_constraint_matrix: Optional[np.ndarray]):
+-        """
+-        This method overwrite the original set_graph_constraint method in DECI class, s.t. it supports the temporal
+-        graph constraints. For the meaning of value in each constraint matrix, please refer to the DECI class docstring.
+-        Args:
+-            graph_constraint_matrix: temporal graph constraints matrix with shape [lag+1, num_nodes, num_nodes] or None.
+-        """
+-        # The implementation is very similar to the original one in DECI class. The difference is that for neg_constraint_matrix
+-        # we need to disable the diagonal elements of constraint[0, ...] rather than the entire constraint matrix in original DECI.
+-        # Also the original implementation only supports 2D matrix.
+-        if graph_constraint_matrix is None:
+-            neg_constraint_matrix = np.ones((self.lag , self.num_nodes, self.num_nodes))
+-            self.neg_constraint_matrix = torch.as_tensor(neg_constraint_matrix, device=self.device, dtype=torch.float32)
+-            self.pos_constraint_matrix = torch.zeros((self.lag, self.num_nodes, self.num_nodes), device=self.device)
+-        else:
+-            negative_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=1.0)
+-            self.neg_constraint_matrix = torch.as_tensor(
+-                negative_constraint_matrix, device=self.device, dtype=torch.float32
+-            )
+-            # Disable diagonal elements in the instant graph constraint.
+-            positive_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=0.0)
+-            self.pos_constraint_matrix = torch.as_tensor(
+-                positive_constraint_matrix, device=self.device, dtype=torch.float32
+-            )
+ 
+     def _log_prob(
+         self,
+@@ -445,7 +524,6 @@ class Rhino(DECI, IModelForTimeseries):
+         intervention_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+         samples_per_graph_groups: int = 1,
+         X_history: Optional[Union[torch.Tensor, np.ndarray]] = None,
+-        time_span: int = 1,
+     ) -> torch.Tensor:
+         """
+         This method samples the observations for the AR-DECI model. For V0, due to the lack of source node model, one has to provide
+@@ -517,7 +595,7 @@ class Rhino(DECI, IModelForTimeseries):
+      
+ 
+             Z = self._sample_base(
+-                    samples_per_graph_groups * N_history_batch, time_span=time_span
++                    samples_per_graph_groups * N_history_batch, time_span=self.pre_len
+                 ) # [batch*samples_per_graph, time_span, proc_dim]
+ 
+ 
+@@ -527,7 +605,7 @@ class Rhino(DECI, IModelForTimeseries):
+             # Iterate over graph samples
+             if intervention_mask is not None and intervention_values is not None:
+                 assert (
+-                    time_span >= intervention_mask.shape[0]
++                    self.pre_len >= intervention_mask.shape[0]
+                 ), "The future ahead time for observation generation must be >= the ahead time for intervention"
+                 # Convert the time_length in intervention mask to be compatible with X_all
+                 false_matrix_conditioning = torch.full(X_history.shape[1:], False, dtype=torch.bool, device=self.device)
+@@ -549,16 +627,16 @@ class Rhino(DECI, IModelForTimeseries):
+ 
+                 # Generate the observations based on the history (given history + previously-generated observations)
+                 # and exogenous noise Z.
+-                predict = self.ICGNN.f.feed_forward(X_history[:, -self.lag:], W_adj=W_adj).transpose(-1, -2) #batch, time_span nodes
++                predict = self.ICGNN.predict(X_history[:, -self.lag:], W_adj=W_adj) #batch, time_span nodes
+     
+                 X_simulate_total.append(predict) #samples_per_graph*batch, time_span pro_dim
+ 
+     
+             predict_f = (
+-                torch.cat(X_simulate_total, dim=0).view(-1, N_history_batch, time_span, proc_dim)
++                torch.cat(X_simulate_total, dim=0).view(-1, N_history_batch, self.pre_len, proc_dim)
+             )  # shape [num_graph_samples, N_history_batch, time_span, proc_dim]
+-            samples = predict_f
+-            # samples = (predict_f.unsqueeze(0) + Z.view(-1, N_history_batch, time_span, proc_dim).unsqueeze(1)).view(-1, N_history_batch, time_span, proc_dim)
++            # samples = predict_f
++            samples = (predict_f.unsqueeze(0) + Z.view(-1, N_history_batch, self.pre_len, proc_dim).unsqueeze(1)).view(-1, N_history_batch, self.pre_len, proc_dim)
+             # else:
+ 
+             #     # Sample weighted graph from posterior with shape [num_graph_samples, lag+1, num_nodes, num_nodes]
+@@ -606,44 +684,6 @@ class Rhino(DECI, IModelForTimeseries):
+ 
+         return samples
+ 
+-    def log_prob(
+-        self,
+-        X: torch.Tensor,
+-        Nsamples_per_graph: int = 100,
+-        most_likely_graph: bool = False,
+-        intervention_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
+-        intervention_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+-    ) -> np.ndarray:
+-        """
+-        This computes the log probability of the observations. For V0, does not support intervention.
+-        Most part is just a copy of parent method, the only difference is that for "conditional_spline", we need to pass
+-        W to self._log_prob.
+-        Args:
+-            X: The observation with shape [N_batch, lag+1, proc_dims]
+-            Nsamples_per_graph: The number of graph samples.
+-            most_likely_graph: whether to use the most likely graph. If true, Nsamples should be 1.
+-            intervention_idxs: Currently not support
+-            intervention_values: Currently not support
+-
+-        Returns: a numpy with shape [N_batch]
+-
+-        """
+-        # Assert for X shape
+-        assert X.dim() == 3, "X should be of shape [N_batch, lag+1, proc_dims]"
+-        # Assertions: intervention_idxs and intervention_values must be None for V0.
+-        assert intervention_idxs is None, "intervention_idxs is not supported for V0"
+-        assert intervention_values is None, "intervention_values is not supported for V0"
+-        # Assertions: Nsamples_per_graph must be 1 if most_likely_graph is true.
+-        if most_likely_graph:
+-            assert Nsamples_per_graph == 1, "Nsamples_per_graph should be 1 if most_likely_graph is true"
+-
+-        return super().log_prob(
+-            X=X,
+-            Nsamples_per_graph=Nsamples_per_graph,
+-            most_likely_graph=most_likely_graph,
+-            intervention_idxs=intervention_idxs,
+-            intervention_values=intervention_values,
+-        )
+ 
+     def get_params_variational_distribution(
+         self, x: torch.Tensor, mask: torch.Tensor
+@@ -673,6 +713,24 @@ class Rhino(DECI, IModelForTimeseries):
+         For V0, we do not support missing values, so there is no imputer. Raise NotImplementedError for now.
+         """
+         raise NotImplementedError
++   
++    def cate(
++        self,
++        intervention_idxs: Union[torch.Tensor, np.ndarray],
++        intervention_values: Union[torch.Tensor, np.ndarray],
++        reference_values: Optional[np.ndarray] = None,
++        effect_idxs: Optional[np.ndarray] = None,
++        conditioning_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
++        conditioning_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
++        Nsamples_per_graph: int = 1,
++        Ngraphs: Optional[int] = 1000,
++        most_likely_graph: bool = False,
++        fixed_seed: Optional[int] = None,
++    ):
++        """
++        Evaluate (optionally conditional) average treatment effect given the learnt causal model.
++        """
++        raise NotImplementedError
+ 
+     def process_dataset(
+         self,
+@@ -686,7 +744,18 @@ class Rhino(DECI, IModelForTimeseries):
+         we have the support for missing values.
+         """
+         # Call super().process_dataset to generate data and mask
+-        data, mask = super().process_dataset(dataset, train_config_dict, variables)
++        if variables is None:
++            variables = self.variables
++
++        self.data_processor = DataProcessor(
++            variables,
++            unit_scale_continuous=False,
++            standardize_data_mean=train_config_dict.get("standardize_data_mean", False),
++            standardize_data_std=train_config_dict.get("standardize_data_std", False),
++        )
++        processed_dataset = self.data_processor.process_dataset(dataset)
++        data, mask = processed_dataset.train_data_and_mask
++        data = data.astype(np.float32)
+         # Assert mask is all 1.
+         assert np.all(mask == 1)
+         return data, mask
+@@ -752,29 +821,30 @@ class Rhino(DECI, IModelForTimeseries):
+             num_samples: The size of the training data set.
+         """
+         # The implementation is identical to the one in FT-DECI but with is_autoregressive=True.
++        val_data=None
++
+         dataloader = {
+             'val':{},
+             'test':{}
+         }
+         batch_size = infer_config_dict['batch_size']
+-        time_span = infer_config_dict['time_span']
+         processed_dataset = self.data_processor.process_dataset(dataset)
+         train_data, _ = processed_dataset.train_data_and_mask
+         scaler = StandardScaler()
+         scaler.fit(train_data)
+-        val_data, _ = processed_dataset.val_data_and_mask
+-        val_data = scaler.transform(val_data)
++        # val_data, _ = processed_dataset.val_data_and_mask
++        # val_data = scaler.transform(val_data)
+         test_data, _ = processed_dataset.test_data_and_mask
+         test_data = scaler.transform(test_data)
+         # dataloader['train']['data_len'] = len(train_data)
+-        # dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation, time_span)
++        # dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation, self.pre_len)
+         
+         if val_data is not None:
+             dataloader['val']['data_len'] = len(val_data)
+-            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation, time_span)
++            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation, self.pre_len)
+         if test_data is not None:
+             dataloader['test']['data_len'] = len(test_data)
+-            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation, time_span)
++            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation, self.pre_len)
+         return dataloader
+ 
+     def set_prior_A(
+@@ -837,22 +907,42 @@ class Rhino(DECI, IModelForTimeseries):
+     ) -> Tuple[Union[DataLoader, TemporalTensorDataset], int]:
+ 
+         processed_dataset = self.data_processor.process_dataset(dataset)
+-        val_data, val_mask = processed_dataset.val_data_and_mask
+-        val_dataset = TemporalTensorDataset(
+-            *to_tensors(val_data, val_mask, device=self.device),
++        train_data, _ = processed_dataset.train_data_and_mask
++        scaler = StandardScaler()
++        scaler.fit(train_data)
++        # change tag
++        val_data, val_mask = processed_dataset.test_data_and_mask
++        #val_data_and_mask
++        val_data = scaler.transform(val_data)
++        val_dataset = MyTemporalTensorDataset(
++            *to_tensors(val_data, device=self.device),
+             lag=self.lag,
+             is_autoregressive=True,
+-            index_segmentation=dataset.get_val_segmentation(),
++            index_segmentation=dataset._test_segmentation,
+         )
++        #dataset.get_val_segmentation(),
+         val_dataloader = DataLoader(val_dataset, batch_size=train_config_dict["batch_size"], shuffle=True)
+ 
+         return val_dataloader, len(val_dataset)
++    
++    def print_tracker(self, inner_step: int, tracker: dict) -> None:
++        """Prints formatted contents of loss terms that are being tracked."""
++        tracker_copy = tracker.copy()
++
++        out = (
++            f"Inner Step: {inner_step}"
++        )
++
++        for k, v in tracker_copy.items():
++            out += f", {k}: {np.mean(v[-100:]):.4f}"
++
++        print(out)
+ 
+     def run_train(
+         self,
+         dataset: Dataset,
+         train_config_dict: Optional[Dict[str, Any]] = None,
+-        report_progress_callback: Optional[Callable[[str, int, int], None]] = None,
++        infer_config_dict: Optional[Dict[str, Any]] = None,
+     ) -> None:
+         """
+         This method implements the training scripts of AR-DECI. This also setup a soft prior (if exists) for the AR-DECI.
+@@ -878,11 +968,114 @@ class Rhino(DECI, IModelForTimeseries):
+         # Inner loop by calling self.optimize_inner_auglag(...). No change is needed.
+         # Update rho, alpha, loss tracker (similar to DECI).
+         assert train_config_dict["max_p_train_dropout"] == 0.0, "Current AR-DECI does not support missing values."
+-        super().run_train(
+-            dataset,
+-            train_config_dict=train_config_dict,
+-            report_progress_callback=report_progress_callback,
+-        )
++
++        dataloader, num_samples = self._create_dataset_for_deci(dataset, train_config_dict)
++
++        # create dataloader for validation
++        if dataset.has_val_data:
++            # get processed dataset
++            val_dataloader, _ = self._create_val_dataset_for_deci(dataset, train_config_dict)
++
++        # initialise logging machinery
++        train_output_dir = os.path.join(self.save_dir, "train_output")
++        os.makedirs(train_output_dir, exist_ok=True)
++        log_path = os.path.join(train_output_dir, "summary")
++        print("Saving logs to", log_path)
++
++
++        base_lr = train_config_dict["learning_rate"]
++        patience =  train_config_dict["patience"]
++
++        # This allows the setting of the starting learning rate of each of the different submodules in the config, e.g. "likelihoods_learning_rate".
++        parameter_list = [
++            {
++                "params": module.parameters(),
++                "lr": train_config_dict.get(f"{name}_learning_rate", base_lr),
++                "name": name,
++            }
++            for name, module in self.named_children()
++        ] 
++
++
++        def get_lr():
++            for param_group in self.opt.param_groups:
++                return param_group["lr"]
++
++        def set_lr(factor):
++            for param_group in self.opt.param_groups:
++                param_group["lr"] = param_group["lr"] * factor
++
++        def initialize_lr():
++            base_lr = train_config_dict["learning_rate"]
++            for param_group in self.opt.param_groups:
++                name = param_group["name"]
++                param_group["lr"] = train_config_dict.get(f"{name}_learning_rate", base_lr)
++
++        self.opt = torch.optim.Adam(parameter_list)
++        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max = train_config_dict['warm_up_step'])
++
++        best_log_p_x = -np.inf
++        best_mse = np.inf
++        outer_step_start_time =None
++        count = 0
++        batch_size = train_config_dict['batch_size']
++        for step in range(train_config_dict["max_steps_auglag"]):
++            count += 1
++            # Inner loop
++            print("LR:", get_lr())
++            print(f"Auglag Epoch: {step}")
++            tracker_loss_terms: Dict = defaultdict(list)
++            inner_step = 0
++            for x, _ in dataloader:
++                loss, tracker_loss_terms = self.compute_loss(
++                    step,
++                    x,
++                    num_samples,
++                    tracker_loss_terms,
++                    train_config_dict
++                )
++                inner_step += 1
++
++                loss = loss*batch_size/32
++                loss.backward()
++                # 梯度累计
++                if batch_size * inner_step % 32 == 0:
++                    self.opt.step()
++                    self.opt.zero_grad()
++
++                    log_step = len(str(round(num_samples/32)))-1
++                    if round(num_samples/32)/(log_step*10.) <= 1:
++                        log_step = log_step +1
++
++                    if int(inner_step) % (log_step*10) == 0:
++                        self.print_tracker(inner_step, tracker_loss_terms)
++
++            print(f" Epoch Steps: {inner_step}")   
++            mse_sample = self.run_inference_with_dataloader(val_dataloader, infer_config_dict)
++            val_mse = mse_sample.mean()
++            if val_mse < best_mse:
++                self.save(best=True)
++                print(f"Saved new best checkpoint with {val_mse} instead of {best_mse}")
++                best_mse = val_mse
++                count = 0
++
++            
++            if outer_step_start_time!=None:
++                outer_step_time = time.time() - outer_step_start_time
++                print("Time taken for this epoch", outer_step_time)
++     
++            outer_step_start_time = time.time()
++
++            self.scheduler.step()
++            # adjust_learning_rate
++            # if step%train_config_dict['reduce_lr_step'] ==0:
++            #     set_lr(0.1)
++            # if step%train_config_dict['warm_up_step']  ==0:
++            #     initialize_lr()
++            # # early stop
++            # if count > patience:
++            #     break
++        self.save()
+ 
+     def run_inference(self, dataset, infer_config_dict):
+         dataloader = self._create_dataset_for_sample(dataset, infer_config_dict)
+@@ -893,34 +1086,36 @@ class Rhino(DECI, IModelForTimeseries):
+         }
+ 
+         for k, item in dataloader.items():
++            if item == {}:
++                continue
+             total_metric[k]['data_num'] = item['data_len']
+             metric={}
+-            mse_sample = None
++
+             # acc_sample = None
+             # acc_mask = None
+             # target_all = None
+             # predicts_all = None
+-            for x_, target_ in item['loader']:
+-                x=x_[0] #batch lag nodes
+-                pre_value = x[:,-1].clone() #batch node
+-                # #normalize
+-                # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
+-                # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
+-                # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
+-                # x = (x - x_mean)/x_std
+-
+-                target=target_[0] # batch time_span nodes
+-                predicts = self.sample(X_history=x,
+-                                    Nsamples=infer_config_dict['Nsamples'],
+-                                    most_likely_graph=infer_config_dict['most_likely_graph'],
+-                                    intervention_idxs=infer_config_dict['intervention_idxs'],
+-                                    intervention_values=infer_config_dict['intervention_values'],
+-                                    samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'],
+-                                    time_span = infer_config_dict['time_span'])
++            mse_sample = self.run_inference_with_dataloader(item['loader'], infer_config_dict)
++            # for x_, target_ in item['loader']:
++            #     x=x_[0] #batch lag nodes
++            #     pre_value = x[:,-1].clone() #batch node
++            #     # #normalize
++            #     # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
++            #     # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
++            #     # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
++            #     # x = (x - x_mean)/x_std
++
++            #     target=target_[0] # batch time_span nodes
++            #     predicts = self.sample(X_history=x,
++            #                         Nsamples=infer_config_dict['Nsamples'],
++            #                         most_likely_graph=infer_config_dict['most_likely_graph'],
++            #                         intervention_idxs=infer_config_dict['intervention_idxs'],
++            #                         intervention_values=infer_config_dict['intervention_values'],
++            #                         samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'])
+                 
+-                mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
++            #     mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
+ 
+-                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
++            #     mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
+     
+                 # target_all = torch.cat([target_all,target], dim = 0) if target_all != None else target
+                 # predicts_all = torch.cat([predicts_all,predicts], dim = 1) if predicts_all != None else predicts
+@@ -929,7 +1124,7 @@ class Rhino(DECI, IModelForTimeseries):
+             #     target_all[..., i] = normalizer.inverse_transform(target_all[[..., i]])
+             #     predicts_all[..., i] = normalizer.inverse_transform(predicts_all[..., i])
+             
+-           
++            
+ 
+                 # renormalize
+                 # predicts = self.scaler.inverse_transform(predicts)
+@@ -975,11 +1170,34 @@ class Rhino(DECI, IModelForTimeseries):
+             
+             total_metric[k]['metric']=metric
+ 
+-                    
++        return total_metric
+ 
++    def run_inference_with_dataloader(self, dataloader, infer_config_dict):
++        mse_sample = None
++        for x_, target_ in dataloader:
++                x=x_[0] #batch lag nodes
++                pre_value = x[:,-1].clone() #batch node
++                # #normalize
++                # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
++                # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
++                # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
++                # x = (x - x_mean)/x_std
+ 
+-        return total_metric
++                target=target_[0] # batch time_span nodes
++                predicts = self.sample(X_history=x,
++                                    Nsamples=infer_config_dict['Nsamples'],
++                                    most_likely_graph=infer_config_dict['most_likely_graph'],
++                                    intervention_idxs=infer_config_dict['intervention_idxs'],
++                                    intervention_values=infer_config_dict['intervention_values'],
++                                    samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'])
++                
++                mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
+ 
++                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
++    
++                # target_all = torch.cat([target_all,target], dim = 0) if target_all != None else target
++                # predicts_all = torch.cat([predicts_all,predicts], dim = 1) if predicts_all != None else predicts
++        return  mse_sample
+ 
+ 
+     def get_adj_matrix_tensor(
+@@ -1008,7 +1226,7 @@ class Rhino(DECI, IModelForTimeseries):
+             )
+         else:
+             raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
+-        return self._apply_constraints(adj)
++        return adj
+ 
+ 
+     def get_adj_matrix(
+@@ -1045,13 +1263,33 @@ class Rhino(DECI, IModelForTimeseries):
+         """
+         A_samples = self.get_adj_matrix_tensor(x_history, do_round, samples, most_likely_graph)
+ 
+-        W_adjs = A_samples * self.ICGNN.get_weighted_adjacency().unsqueeze(0)
++        W_adjs = A_samples # * self.ICGNN.get_weighted_adjacency().unsqueeze(0)
+ 
+         if squeeze and samples == 1:
+             W_adjs = W_adjs.squeeze(0)
+ 
+         return W_adjs
+     
++    def _log_prior_A(self, A: torch.Tensor) -> torch.Tensor:
++        """
++        Computes the prior for adjacency matrix A, which consitst on a term encouraging DAGness
++        and another encouraging sparsity (see https://arxiv.org/pdf/2106.07635.pdf).
++
++        Args:
++            A: Adjancency matrix of shape (input_dim, input_dim), binary.
++
++        Returns:
++            Log probability of A for prior distribution, a number.
++        """
++
++        sparse_term = -self.lambda_sparse * A.abs().sum()
++        if self.exist_prior:
++            prior_term = (
++                -self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
++            )
++            return sparse_term + prior_term
++        else:
++            return sparse_term
+ 
+     def _ELBO_terms(self, X: torch.Tensor) -> Dict[str, torch.Tensor]:
+         """
+@@ -1076,11 +1314,11 @@ class Rhino(DECI, IModelForTimeseries):
+             factor_q = 0.0
+         else:
+             raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
+- 
+-        W_adj = A_sample * self.ICGNN.get_weighted_adjacency()  #[batch, lag, nodes, nodes]
+-        predict = self.ICGNN.predict(x_history, W_adj).transpose(-1,-2)  # batch pre_len nodes
+-        log_p_A = self._log_prior_A(A_sample)  # A number
++        
+ 
++        W_adj = A_sample # * self.ICGNN.get_weighted_adjacency()  #[batch, lag, nodes, nodes]
++        predict = self.ICGNN.predict(x_history, W_adj)  # batch pre_len nodes
++        log_p_A = self._log_prior_A(A_sample)  # A number
+         
+         log_p_base = self._log_prob(
+                 X,
+@@ -1089,7 +1327,7 @@ class Rhino(DECI, IModelForTimeseries):
+             )  # (B)
+ 
+             # self.ICGNN.predict(X, W_adj)
+-        log_q_A = self.var_dist_A.entropy()  # A number
++        log_q_A = -self.var_dist_A.entropy()  # A number
+         
+ 
+         # renormalize
+@@ -1108,15 +1346,9 @@ class Rhino(DECI, IModelForTimeseries):
+         self,
+         step: int,
+         x: torch.Tensor,
+-        mask_train_batch: torch.Tensor,
+-        input_mask: torch.Tensor,
+         num_samples: int,
+         tracker: Dict,
+         train_config_dict: Dict[str, Any],
+-        alpha: float = None,
+-        rho: float = None,
+-        adj_true: Optional[np.ndarray] = None,
+-        compute_cd_fscore: bool = False,
+         **kwargs,
+     ) -> Tuple[torch.Tensor, Dict]:
+         """Computes the loss and updates trackers of different terms.
+@@ -1151,15 +1383,19 @@ class Rhino(DECI, IModelForTimeseries):
+ 
+ 
+         if train_config_dict["anneal_entropy"] == "linear":
+-            ELBO = log_p_term  - log_q_A_term / max(step - 5, 1) #-  log_p_A_term
++            ELBO = log_p_term  - log_q_A_term / max(step - 5, 1) +  log_p_A_term/max(step - 5, 1) 
+         elif train_config_dict["anneal_entropy"] == "noanneal":
+-            ELBO = log_p_term  - log_q_A_term #- log_p_A_term
++            ELBO = log_p_term  - log_q_A_term + log_p_A_term / max(step - 5, 1) 
++        print('elbo', ELBO)
++        input()
+         loss = -ELBO
+ 
+ 
+         tracker["loss"].append(loss.item())
+         
+         # loss = loss +  cts_mse
++                #change
++
+ 
+         tracker["log_p_A_sparse"].append(log_p_A_term.item())
+         tracker["log_p_x"].append(log_p_term.item())
+diff --git a/causica/models/deci/variational_distributions.py b/causica/models/deci/variational_distributions.py
+index b22b675..8d2c2a3 100644
+--- a/causica/models/deci/variational_distributions.py
++++ b/causica/models/deci/variational_distributions.py
+@@ -517,7 +517,9 @@ class TemporalThreeWayGrahpDist(nn.Module):
+         # Entropy for lagged dist
+         # batch_shape [lag], event_shape [num_nodes, num_nodes]
+         dist_lag = td.Independent(td.Bernoulli(logits=self.final_logits_lag[1, ...] - self.final_logits_lag[0, ...]), 2)
++        # entropies_lag = dist_lag.entropy().sum() #change
+         entropies_lag = dist_lag.entropy().sum()
++        # input(dist_lag.entropy().size())
+         return entropies_lag 
+ 
+     def sample_A(self, x_history) -> torch.Tensor:
+diff --git a/causica/models_factory.py b/causica/models_factory.py
+index 9b2211e..990b6d3 100644
+--- a/causica/models_factory.py
++++ b/causica/models_factory.py
+@@ -32,6 +32,10 @@ from .models.deci.deci_gaussian import DECIGaussian
+ from .models.deci.deci_spline import DECISpline
+ from .models.deci.fold_time_deci import FoldTimeDECI
+ from .models.deci.rhino import Rhino
++from .models.deci.rhino_autoformer import Rhino_Auto
++from .models.deci.rhino_informer import Rhino_Informer
++from .models.deci.rhino_timesnet import Rhino_TimeS
++from .models.deci.rhino_estformer import Rhino_EST
+ from .models.imodel import IModel
+ from .models.point_net import PointNet, SparsePointNet
+ from .models.set_encoder_base_model import SetEncoderBaseModel
+@@ -45,6 +49,10 @@ MODEL_SUBCLASSES: Dict[str, Type[IModel]] = {
+     for model in (
+         # Models
+         Rhino,
++        Rhino_Auto,
++        Rhino_Informer,
++        Rhino_TimeS,
++        Rhino_EST,
+         DECI,
+         VISL,
+         DECIGaussian,
+diff --git a/configs/deci/deci.json b/configs/deci/deci.json
+deleted file mode 100644
+index 34ad5aa..0000000
+--- a/configs/deci/deci.json
++++ /dev/null
+@@ -1,39 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_gaussian.json b/configs/deci/deci_gaussian.json
+deleted file mode 100644
+index 121e7f1..0000000
+--- a/configs/deci/deci_gaussian.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_gaussian_dowhy_linear.json b/configs/deci/deci_gaussian_dowhy_linear.json
+deleted file mode 100644
+index 5547e6d..0000000
+--- a/configs/deci/deci_gaussian_dowhy_linear.json
++++ /dev/null
+@@ -1,49 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "discovery_config": {
+-            "base_distribution_type": "gaussian",
+-            "imputation": false,
+-            "tau_gumbel": 0.25,
+-            "lambda_dag": 100.0,
+-            "lambda_sparse": 5.0,
+-            "var_dist_A_mode": "enco",
+-            "mode_adjacency": "learn",
+-            "norm_layers": true,
+-            "res_connection": true,
+-            "cate_rff_n_features": 3000,
+-            "cate_rff_lengthscale": 1
+-        },
+-        "inference_config": {
+-            "linear": true
+-        }
+-    },
+-    "training_hyperparams": {
+-        "discovery_config": {
+-            "learning_rate": 1e-2,
+-            "batch_size": 128,
+-            "stardardize_data_mean": false,
+-            "stardardize_data_std": false,
+-            "rho": 1.0,
+-            "safety_rho": 1e13,
+-            "alpha": 0.0,
+-            "safety_alpha": 1e13,
+-            "tol_dag": 1e-5,
+-            "progress_rate": 0.65,
+-            "max_steps_auglag": 100,
+-            "max_auglag_inner_epochs": 6000,
+-            "max_p_train_dropout": 0.6,
+-            "reconstruction_loss_factor": 1.0,
+-            "anneal_entropy": "noanneal"
+-        },
+-        "inference_config": {
+-            "max_graph_samples": 10
+-        }
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_gaussian_dowhy_nonlinear.json b/configs/deci/deci_gaussian_dowhy_nonlinear.json
+deleted file mode 100644
+index 0b55bc3..0000000
+--- a/configs/deci/deci_gaussian_dowhy_nonlinear.json
++++ /dev/null
+@@ -1,52 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "discovery_config": {
+-            "base_distribution_type": "gaussian",
+-            "imputation": false,
+-            "tau_gumbel": 0.25,
+-            "lambda_dag": 100.0,
+-            "lambda_sparse": 5.0,
+-            "spline_bins": 8,
+-            "var_dist_A_mode": "enco",
+-            "mode_adjacency": "learn",
+-            "norm_layers": true,
+-            "res_connection": true,
+-            "cate_rff_n_features": 3000,
+-            "cate_rff_lengthscale": 1
+-        },
+-        "inference_config": {
+-            "linear": false,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-    },
+-    "training_hyperparams": {
+-        "discovery_config": {
+-            "learning_rate": 1e-2,
+-            "batch_size": 128,
+-            "stardardize_data_mean": false,
+-            "stardardize_data_std": false,
+-            "rho": 1.0,
+-            "safety_rho": 1e13,
+-            "alpha": 0.0,
+-            "safety_alpha": 1e13,
+-            "tol_dag": 1e-5,
+-            "progress_rate": 0.65,
+-            "max_steps_auglag": 100,
+-            "max_auglag_inner_epochs": 6000,
+-            "max_p_train_dropout": 0.6,
+-            "reconstruction_loss_factor": 1.0,
+-            "anneal_entropy": "noanneal"
+-        },
+-        "inference_config": {
+-            "max_graph_samples": 10
+-        }
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_gaussian_fast.json b/configs/deci/deci_gaussian_fast.json
+deleted file mode 100644
+index a52d5b5..0000000
+--- a/configs/deci/deci_gaussian_fast.json
++++ /dev/null
+@@ -1,41 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "var_dist_A_mode": "three",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            42
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1,
+-        "encoder_layer_sizes": [
+-            32,
+-            32
+-        ],
+-        "decoder_layer_sizes": [
+-            32,
+-            32
+-        ]
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 3e-2,
+-        "batch_size": 512,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 10.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-3,
+-        "progress_rate": 0.25,
+-        "max_steps_auglag": 20,
+-        "max_auglag_inner_epochs": 1000,
+-        "max_p_train_dropout": 0.25,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_gaussian_imputation.json b/configs/deci/deci_gaussian_imputation.json
+deleted file mode 100644
+index f5d42f5..0000000
+--- a/configs/deci/deci_gaussian_imputation.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": true,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 3.0,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_spline.json b/configs/deci/deci_spline.json
+deleted file mode 100644
+index 58f5526..0000000
+--- a/configs/deci/deci_spline.json
++++ /dev/null
+@@ -1,40 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "likelihoods_learning_rate": 1e-3,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_spline_dowhy_linear.json b/configs/deci/deci_spline_dowhy_linear.json
+deleted file mode 100644
+index 36a2999..0000000
+--- a/configs/deci/deci_spline_dowhy_linear.json
++++ /dev/null
+@@ -1,51 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "discovery_config": {
+-            "base_distribution_type": "spline",
+-            "imputation": false,
+-            "tau_gumbel": 0.25,
+-            "lambda_dag": 100.0,
+-            "lambda_sparse": 5.0,
+-            "spline_bins": 8,
+-            "var_dist_A_mode": "enco",
+-            "mode_adjacency": "learn",
+-            "norm_layers": true,
+-            "res_connection": true,
+-            "cate_rff_n_features": 3000,
+-            "cate_rff_lengthscale": 1
+-        },
+-        "inference_config": {
+-            "linear": true
+-        }
+-    },
+-    "training_hyperparams": {
+-        "discovery_config": {
+-            "learning_rate": 1e-2,
+-            "likelihoods_learning_rate": 1e-3,
+-            "batch_size": 128,
+-            "stardardize_data_mean": false,
+-            "stardardize_data_std": false,
+-            "rho": 1.0,
+-            "safety_rho": 1e13,
+-            "alpha": 0.0,
+-            "safety_alpha": 1e13,
+-            "tol_dag": 1e-5,
+-            "progress_rate": 0.65,
+-            "max_steps_auglag": 100,
+-            "max_auglag_inner_epochs": 6000,
+-            "max_p_train_dropout": 0.6,
+-            "reconstruction_loss_factor": 1.0,
+-            "anneal_entropy": "noanneal"
+-        },
+-        "inference_config": {
+-            "max_graph_samples": 10
+-        }
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_spline_dowhy_nonlinear.json b/configs/deci/deci_spline_dowhy_nonlinear.json
+deleted file mode 100644
+index 851b5df..0000000
+--- a/configs/deci/deci_spline_dowhy_nonlinear.json
++++ /dev/null
+@@ -1,53 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "discovery_config": {
+-            "base_distribution_type": "spline",
+-            "imputation": false,
+-            "tau_gumbel": 0.25,
+-            "lambda_dag": 100.0,
+-            "lambda_sparse": 5.0,
+-            "spline_bins": 8,
+-            "var_dist_A_mode": "enco",
+-            "mode_adjacency": "learn",
+-            "norm_layers": true,
+-            "res_connection": true,
+-            "cate_rff_n_features": 3000,
+-            "cate_rff_lengthscale": 1
+-        },
+-        "inference_config": {
+-            "linear": false,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-    },
+-    "training_hyperparams": {
+-        "discovery_config": {
+-            "learning_rate": 1e-2,
+-            "likelihoods_learning_rate": 1e-3,
+-            "batch_size": 128,
+-            "stardardize_data_mean": false,
+-            "stardardize_data_std": false,
+-            "rho": 1.0,
+-            "safety_rho": 1e13,
+-            "alpha": 0.0,
+-            "safety_alpha": 1e13,
+-            "tol_dag": 1e-5,
+-            "progress_rate": 0.65,
+-            "max_steps_auglag": 100,
+-            "max_auglag_inner_epochs": 6000,
+-            "max_p_train_dropout": 0.6,
+-            "reconstruction_loss_factor": 1.0,
+-            "anneal_entropy": "noanneal"
+-        },
+-        "inference_config": {
+-            "max_graph_samples": 10
+-        }
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_spline_fast.json b/configs/deci/deci_spline_fast.json
+deleted file mode 100644
+index 17e5a21..0000000
+--- a/configs/deci/deci_spline_fast.json
++++ /dev/null
+@@ -1,43 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "three",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            42
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1,
+-        "encoder_layer_sizes": [
+-            32,
+-            32
+-        ],
+-        "decoder_layer_sizes": [
+-            32,
+-            32
+-        ]
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 3e-2,
+-        "likelihoods_learning_rate": 3e-3,
+-        "batch_size": 512,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 10.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-3,
+-        "progress_rate": 0.25,
+-        "max_steps_auglag": 20,
+-        "max_auglag_inner_epochs": 1000,
+-        "max_p_train_dropout": 0.25,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/deci_spline_imputation.json b/configs/deci/deci_spline_imputation.json
+deleted file mode 100644
+index 9521c1e..0000000
+--- a/configs/deci/deci_spline_imputation.json
++++ /dev/null
+@@ -1,40 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": true,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 3.0,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "likelihoods_learning_rate": 1e-3,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/dowhy_linear.json b/configs/deci/dowhy_linear.json
+deleted file mode 100644
+index 28737fd..0000000
+--- a/configs/deci/dowhy_linear.json
++++ /dev/null
+@@ -1,10 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [0, 1, 2, 3, 4],
+-        
+-        "inference_config": {
+-            "linear": true
+-        }
+-    },
+-    "training_hyperparams": {}
+-}
+\ No newline at end of file
+diff --git a/configs/deci/dowhy_nonlinear.json b/configs/deci/dowhy_nonlinear.json
+deleted file mode 100644
+index 699ba34..0000000
+--- a/configs/deci/dowhy_nonlinear.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [0, 1, 2, 3, 4],
+-        "inference_config": {
+-            "linear": false,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-    },
+-    "training_hyperparams": {}
+-}
+\ No newline at end of file
+diff --git a/configs/deci/informed_deci_gaussian.json b/configs/deci/informed_deci_gaussian.json
+deleted file mode 100644
+index 1a7bddd..0000000
+--- a/configs/deci/informed_deci_gaussian.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 10.0,
+-        "base_distribution_type": "gaussian",
+-        "imputation": false,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "prior_A_confidence": 0.5
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "likelihoods_learning_rate": 1e-3,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-6,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/informed_deci_spline.json b/configs/deci/informed_deci_spline.json
+deleted file mode 100644
+index 5da4efc..0000000
+--- a/configs/deci/informed_deci_spline.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 10.0,
+-        "base_distribution_type": "spline",
+-        "imputation": false,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "prior_A_confidence": 0.5
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "likelihoods_learning_rate": 1e-3,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-6,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/pc_dowhy_linear.json b/configs/deci/pc_dowhy_linear.json
+deleted file mode 100644
+index 6d24951..0000000
+--- a/configs/deci/pc_dowhy_linear.json
++++ /dev/null
+@@ -1,23 +0,0 @@
+-{
+-
+-    "model_hyperparams": {
+-
+-        "random_seed": [0, 1, 2, 3, 4],
+-
+-        "inference_config": {
+-            "linear": true,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-
+-    },
+-
+-    "training_hyperparams": {
+-
+-        "inference_config": {
+-            "max_graph_samples": 10
+-        }
+-
+-    }
+-
+-}
+diff --git a/configs/deci/pc_dowhy_nonlinear.json b/configs/deci/pc_dowhy_nonlinear.json
+deleted file mode 100644
+index d3bec4b..0000000
+--- a/configs/deci/pc_dowhy_nonlinear.json
++++ /dev/null
+@@ -1,23 +0,0 @@
+-{
+-
+-    "model_hyperparams": {
+-
+-        "random_seed": [0, 1, 2, 3, 4],
+-
+-        "inference_config": {
+-            "linear": false,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-
+-    },
+-
+-    "training_hyperparams": {
+-
+-        "inference_config": {
+-            "max_graph_samples": 10
+-        }
+-
+-    }
+-
+-}
+diff --git a/configs/deci/pc_informed_deci_gaussian.json b/configs/deci/pc_informed_deci_gaussian.json
+deleted file mode 100644
+index 1a7bddd..0000000
+--- a/configs/deci/pc_informed_deci_gaussian.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 10.0,
+-        "base_distribution_type": "gaussian",
+-        "imputation": false,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "prior_A_confidence": 0.5
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "likelihoods_learning_rate": 1e-3,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-6,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/pc_informed_deci_spline.json b/configs/deci/pc_informed_deci_spline.json
+deleted file mode 100644
+index 5da4efc..0000000
+--- a/configs/deci/pc_informed_deci_spline.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 10.0,
+-        "base_distribution_type": "spline",
+-        "imputation": false,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "enco",
+-        "mode_adjacency": "learn",
+-        "prior_A_confidence": 0.5
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "likelihoods_learning_rate": 1e-3,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-6,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/true_graph_deci_gaussian.json b/configs/deci/true_graph_deci_gaussian.json
+deleted file mode 100644
+index b14b7a3..0000000
+--- a/configs/deci/true_graph_deci_gaussian.json
++++ /dev/null
+@@ -1,38 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "var_dist_A_mode": "true",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/true_graph_deci_spline.json b/configs/deci/true_graph_deci_spline.json
+deleted file mode 100644
+index 7d55040..0000000
+--- a/configs/deci/true_graph_deci_spline.json
++++ /dev/null
+@@ -1,39 +0,0 @@
+-{
+-    "model_hyperparams": {
+-        "imputation": false,
+-        "tau_gumbel": 0.25,
+-        "lambda_dag": 100.0,
+-        "lambda_sparse": 5.0,
+-        "spline_bins": 8,
+-        "var_dist_A_mode": "true",
+-        "mode_adjacency": "learn",
+-        "norm_layers": true,
+-        "res_connection": true,
+-        "random_seed": [
+-            0,
+-            1,
+-            2,
+-            3,
+-            4
+-        ],
+-        "cate_rff_n_features": 3000,
+-        "cate_rff_lengthscale": 1
+-    },
+-    "training_hyperparams": {
+-        "learning_rate": 1e-2,
+-        "batch_size": 128,
+-        "stardardize_data_mean": false,
+-        "stardardize_data_std": false,
+-        "rho": 1.0,
+-        "safety_rho": 1e13,
+-        "alpha": 0.0,
+-        "safety_alpha": 1e13,
+-        "tol_dag": 1e-5,
+-        "progress_rate": 0.65,
+-        "max_steps_auglag": 100,
+-        "max_auglag_inner_epochs": 6000,
+-        "max_p_train_dropout": 0.6,
+-        "reconstruction_loss_factor": 1.0,
+-        "anneal_entropy": "noanneal"
+-    }
+-}
+\ No newline at end of file
+diff --git a/configs/deci/true_graph_dowhy_linear.json b/configs/deci/true_graph_dowhy_linear.json
+deleted file mode 100644
+index 180924f..0000000
+--- a/configs/deci/true_graph_dowhy_linear.json
++++ /dev/null
+@@ -1,21 +0,0 @@
+-{
+-
+-    "model_hyperparams": {
+-
+-        "random_seed": [0, 1, 2, 3, 4],
+-
+-
+-        "inference_config": {
+-            "linear": true,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-
+-    },
+-
+-    "training_hyperparams": {
+-
+-
+-    }
+-
+-}
+\ No newline at end of file
+diff --git a/configs/deci/true_graph_dowhy_nonlinear.json b/configs/deci/true_graph_dowhy_nonlinear.json
+deleted file mode 100644
+index 0000559..0000000
+--- a/configs/deci/true_graph_dowhy_nonlinear.json
++++ /dev/null
+@@ -1,20 +0,0 @@
+-{
+-
+-    "model_hyperparams": {
+-
+-        "random_seed": [0, 1, 2, 3, 4],
+-        
+-        "inference_config": {
+-            "linear": false,
+-            "polynomial_order": 2,
+-            "polynomial_bias": true
+-        }
+-
+-    },
+-
+-    "training_hyperparams": {
+-
+-
+-    }
+-
+-}
+\ No newline at end of file
+diff --git a/configs/infer_config_temporal_causal_dataset.json b/configs/infer_config_temporal_causal_dataset.json
+index 8e2a4e4..3b679b4 100644
+--- a/configs/infer_config_temporal_causal_dataset.json
++++ b/configs/infer_config_temporal_causal_dataset.json
+@@ -1,7 +1,6 @@
+ {
+     "batch_size": 64,
+-    "Nsamples": 10,
+-    "time_span": 96,
++    "Nsamples": 50,
+     "most_likely_graph": true,
+     "intervention_idxs": null,
+     "intervention_values": null,
+diff --git a/configs/protein_data/dataset_config.json b/configs/protein_data/dataset_config.json
+deleted file mode 100644
+index 638c3ea..0000000
+--- a/configs/protein_data/dataset_config.json
++++ /dev/null
+@@ -1,6 +0,0 @@
+-{
+-    "use_predefined_dataset": false,
+-    "test_fraction": 0.1,
+-    "val_fraction": 0.0,
+-    "random_seed": [0]
+-}
+\ No newline at end of file
+diff --git a/configs/rhino/model_config_rhino_electricity_gaussian.json b/configs/rhino/model_config_rhino_electricity_gaussian.json
+index 58b5c9b..8a28196 100644
+--- a/configs/rhino/model_config_rhino_electricity_gaussian.json
++++ b/configs/rhino/model_config_rhino_electricity_gaussian.json
+@@ -3,30 +3,30 @@
+   "ICGNN_embedding_size": null,
+   "additional_spline_flow": 0,
+   "allow_instantaneous": false,
+-  "base_distribution_type": "gaussian",
++  "base_distribution_type":  "gaussian",
+   "cate_rff_lengthscale": [
+     0.1,
+     1
+   ],
+   "cate_rff_n_features": 3000,
+   "conditional_decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_embedding_size": null,
+   "conditional_encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_spline_order": "linear",
+   "decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "disable_diagonal_eval": false,
+   "encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "imputation": false,
+   "init_logits": [
+@@ -36,7 +36,7 @@
+   "lag": 96,
+   "lambda_dag": 10,
+   "lambda_prior": 100000,
+-  "lambda_sparse": 1,
++  "lambda_sparse": 5,
+   "norm_layers": true,
+   "prior_A_confidence": 0.5,
+   "random_seed": 4,
+@@ -44,25 +44,51 @@
+   "spline_bins": 8,
+   "tau_gumbel": 0.25,
+   "var_dist_A_mode": "temporal_three",
+-  "pre_len": 96
++  "pre_len": 96,
++  
++  "log_scale_init": -1.8,
++  
++  "configs":{
++    "d_model" : 512,
++    "d_layers":1,
++
++    "e_layers" : 2,
++    "num_kernels": 6,
++    "d_ff": 512,
++    "top_k": 5,
++    "dropout": 0.1,
++    "embed": "timeF",
++    
++    "freq": "h",
++    "factor":3,
++    "n_heads":8,
++    
++    "activation":"gelu",
++    "moving_avg":25,
++    "output_attention":false
++  }
+ },
+   "training_hyperparams": {
+-    "learning_rate": 0.001,
+-    "likelihoods_learning_rate": 0.001,
+-    "batch_size": 4,
++    "learning_rate": 1e-4,
++    "likelihoods_learning_rate": 1e-4,
++    "batch_size": 32,
+     "stardardize_data_mean": false,
+     "stardardize_data_std": false,
+     "rho": 1.0,
+     "safety_rho": 10000000000000.0,
+     "alpha": 0.0,
+     "safety_alpha": 10000000000000.0,
+-    "tol_dag": -1,
+     "progress_rate": 0.65,
+-    "max_steps_auglag": 10,
+-    "max_auglag_inner_epochs": 2000,
++    "max_steps_auglag": 500,
++
+     "max_p_train_dropout": 0,
+     "reconstruction_loss_factor": 1.0,
+-    "anneal_entropy": "noanneal"
++    "anneal_entropy": "noanneal",
++    
++    
++    "patience":500,
++    "warm_up_step":100,
++    "reduce_lr_step":10
+   },
+   "lambda_sparse": 1
+ }
+\ No newline at end of file
+diff --git a/configs/rhino/model_config_rhino_exchange_rate.json b/configs/rhino/model_config_rhino_exchange_rate.json
+index f210662..9c26cbe 100644
+--- a/configs/rhino/model_config_rhino_exchange_rate.json
++++ b/configs/rhino/model_config_rhino_exchange_rate.json
+@@ -10,23 +10,23 @@
+   ],
+   "cate_rff_n_features": 3000,
+   "conditional_decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_embedding_size": null,
+   "conditional_encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_spline_order": "linear",
+   "decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "disable_diagonal_eval": false,
+   "encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "imputation": false,
+   "init_logits": [
+@@ -44,7 +44,19 @@
+   "spline_bins": 8,
+   "tau_gumbel": 0.25,
+   "var_dist_A_mode": "temporal_three",
+-  "pre_len": 96
++  "pre_len": 96,
++  "log_scale_init": -0.0,
++  "configs":{
++    "d_model" : 256,
++    "e_layers" : 2,
++    "d_layers" : 2,
++    "num_kernels": 6,
++    "d_ff": 512,
++    "top_k": 5,
++    "dropout": 0.1,
++    "embed": "timeF",
++    "freq": "h"
++  }
+ },
+   "training_hyperparams": {
+     "learning_rate": 0.001,
+@@ -58,8 +70,8 @@
+     "safety_alpha": 10000000000000.0,
+     "tol_dag": -1,
+     "progress_rate": 0.65,
+-    "max_steps_auglag": 10,
+-    "max_auglag_inner_epochs": 2000,
++    "max_steps_auglag": 1,
++    "max_auglag_inner_epochs": 20000,
+     "max_p_train_dropout": 0,
+     "reconstruction_loss_factor": 1.0,
+     "anneal_entropy": "noanneal"
+diff --git a/configs/rhino/model_config_rhino_exchange_rate_gaussian.json b/configs/rhino/model_config_rhino_exchange_rate_gaussian.json
+index c716d6c..141aad8 100644
+--- a/configs/rhino/model_config_rhino_exchange_rate_gaussian.json
++++ b/configs/rhino/model_config_rhino_exchange_rate_gaussian.json
+@@ -3,30 +3,30 @@
+   "ICGNN_embedding_size": null,
+   "additional_spline_flow": 0,
+   "allow_instantaneous": false,
+-  "base_distribution_type": "gaussian",
++  "base_distribution_type":  "gaussian",
+   "cate_rff_lengthscale": [
+     0.1,
+     1
+   ],
+   "cate_rff_n_features": 3000,
+   "conditional_decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_embedding_size": null,
+   "conditional_encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_spline_order": "linear",
+   "decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "disable_diagonal_eval": false,
+   "encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "imputation": false,
+   "init_logits": [
+@@ -36,7 +36,7 @@
+   "lag": 96,
+   "lambda_dag": 10,
+   "lambda_prior": 100000,
+-  "lambda_sparse": 1,
++  "lambda_sparse": 5,
+   "norm_layers": true,
+   "prior_A_confidence": 0.5,
+   "random_seed": 4,
+@@ -44,11 +44,33 @@
+   "spline_bins": 8,
+   "tau_gumbel": 0.25,
+   "var_dist_A_mode": "temporal_three",
+-  "pre_len": 96
++  "pre_len": 96,
++  
++  "log_scale_init": -2.46,
++  
++  "configs":{
++    "d_model" : 512,
++    "d_layers":1,
++
++    "e_layers" : 2,
++    "num_kernels": 6,
++    "d_ff": 512,
++    "top_k": 5,
++    "dropout": 0.1,
++    "embed": "timeF",
++    
++    "freq": "h",
++    "factor":3,
++    "n_heads":8,
++    
++    "activation":"gelu",
++    "moving_avg":25,
++    "output_attention":false
++  }
+ },
+   "training_hyperparams": {
+-    "learning_rate": 0.001,
+-    "likelihoods_learning_rate": 0.001,
++    "learning_rate": 1e-4,
++    "likelihoods_learning_rate": 1e-4,
+     "batch_size": 64,
+     "stardardize_data_mean": false,
+     "stardardize_data_std": false,
+@@ -56,13 +78,17 @@
+     "safety_rho": 10000000000000.0,
+     "alpha": 0.0,
+     "safety_alpha": 10000000000000.0,
+-    "tol_dag": -1,
+     "progress_rate": 0.65,
+-    "max_steps_auglag": 5,
+-    "max_auglag_inner_epochs": 2000,
++    "max_steps_auglag": 500,
++
+     "max_p_train_dropout": 0,
+     "reconstruction_loss_factor": 1.0,
+-    "anneal_entropy": "noanneal"
++    "anneal_entropy": "noanneal",
++    
++    
++    "patience":500,
++    "warm_up_step":100,
++    "reduce_lr_step":10
+   },
+   "lambda_sparse": 1
+ }
+\ No newline at end of file
+diff --git a/configs/rhino/model_config_rhino_illness_gaussian.json b/configs/rhino/model_config_rhino_illness_gaussian.json
+index f169e83..3188fc4 100644
+--- a/configs/rhino/model_config_rhino_illness_gaussian.json
++++ b/configs/rhino/model_config_rhino_illness_gaussian.json
+@@ -3,30 +3,30 @@
+   "ICGNN_embedding_size": null,
+   "additional_spline_flow": 0,
+   "allow_instantaneous": false,
+-  "base_distribution_type": "gaussian",
++  "base_distribution_type":  "gaussian",
+   "cate_rff_lengthscale": [
+     0.1,
+     1
+   ],
+   "cate_rff_n_features": 3000,
+   "conditional_decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_embedding_size": null,
+   "conditional_encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_spline_order": "linear",
+   "decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "disable_diagonal_eval": false,
+   "encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "imputation": false,
+   "init_logits": [
+@@ -36,7 +36,7 @@
+   "lag": 36,
+   "lambda_dag": 10,
+   "lambda_prior": 100000,
+-  "lambda_sparse": 1,
++  "lambda_sparse": 5,
+   "norm_layers": true,
+   "prior_A_confidence": 0.5,
+   "random_seed": 4,
+@@ -44,11 +44,33 @@
+   "spline_bins": 8,
+   "tau_gumbel": 0.25,
+   "var_dist_A_mode": "temporal_three",
+-  "pre_len": 96
++  "pre_len": 24,
++  
++  "log_scale_init": 0.8,
++  
++  "configs":{
++    "d_model" : 512,
++    "d_layers":1,
++
++    "e_layers" : 2,
++    "num_kernels": 6,
++    "d_ff": 512,
++    "top_k": 5,
++    "dropout": 0.1,
++    "embed": "timeF",
++    
++    "freq": "h",
++    "factor":3,
++    "n_heads":8,
++    
++    "activation":"gelu",
++    "moving_avg":25,
++    "output_attention":false
++  }
+ },
+   "training_hyperparams": {
+-    "learning_rate": 0.001,
+-    "likelihoods_learning_rate": 0.001,
++    "learning_rate": 1e-4,
++    "likelihoods_learning_rate": 1e-4,
+     "batch_size": 64,
+     "stardardize_data_mean": false,
+     "stardardize_data_std": false,
+@@ -56,13 +78,17 @@
+     "safety_rho": 10000000000000.0,
+     "alpha": 0.0,
+     "safety_alpha": 10000000000000.0,
+-    "tol_dag": -1,
+     "progress_rate": 0.65,
+-    "max_steps_auglag": 20,
+-    "max_auglag_inner_epochs": 2000,
++    "max_steps_auglag": 500,
++
+     "max_p_train_dropout": 0,
+     "reconstruction_loss_factor": 1.0,
+-    "anneal_entropy": "noanneal"
++    "anneal_entropy": "noanneal",
++    
++    
++    "patience":500,
++    "warm_up_step":100,
++    "reduce_lr_step":10
+   },
+   "lambda_sparse": 1
+ }
+\ No newline at end of file
+diff --git a/configs/rhino/model_config_rhino_traffic_gaussian.json b/configs/rhino/model_config_rhino_traffic_gaussian.json
+index aaa2ad6..13936d0 100644
+--- a/configs/rhino/model_config_rhino_traffic_gaussian.json
++++ b/configs/rhino/model_config_rhino_traffic_gaussian.json
+@@ -3,40 +3,40 @@
+   "ICGNN_embedding_size": null,
+   "additional_spline_flow": 0,
+   "allow_instantaneous": false,
+-  "base_distribution_type": "gaussian",
++  "base_distribution_type":  "gaussian",
+   "cate_rff_lengthscale": [
+     0.1,
+     1
+   ],
+   "cate_rff_n_features": 3000,
+   "conditional_decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_embedding_size": null,
+   "conditional_encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_spline_order": "linear",
+   "decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "disable_diagonal_eval": false,
+   "encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "imputation": false,
+   "init_logits": [
+     0,
+     0
+   ],
+-  "lag": 12,
++  "lag": 96,
+   "lambda_dag": 10,
+   "lambda_prior": 100000,
+-  "lambda_sparse": 25,
++  "lambda_sparse": 5,
+   "norm_layers": true,
+   "prior_A_confidence": 0.5,
+   "random_seed": 4,
+@@ -44,11 +44,33 @@
+   "spline_bins": 8,
+   "tau_gumbel": 0.25,
+   "var_dist_A_mode": "temporal_three",
+-  "pre_len": 96
++  "pre_len": 96,
++  
++  "log_scale_init": -0.9,
++  
++  "configs":{
++    "d_model" : 512,
++    "d_layers":1,
++
++    "e_layers" : 2,
++    "num_kernels": 6,
++    "d_ff": 512,
++    "top_k": 5,
++    "dropout": 0.1,
++    "embed": "timeF",
++    
++    "freq": "h",
++    "factor":3,
++    "n_heads":8,
++    
++    "activation":"gelu",
++    "moving_avg":25,
++    "output_attention":false
++  }
+ },
+   "training_hyperparams": {
+-    "learning_rate": 0.001,
+-    "likelihoods_learning_rate": 0.001,
++    "learning_rate": 1e-4,
++    "likelihoods_learning_rate": 1e-4,
+     "batch_size": 1,
+     "stardardize_data_mean": false,
+     "stardardize_data_std": false,
+@@ -56,13 +78,17 @@
+     "safety_rho": 10000000000000.0,
+     "alpha": 0.0,
+     "safety_alpha": 10000000000000.0,
+-    "tol_dag": -1,
+     "progress_rate": 0.65,
+-    "max_steps_auglag": 60,
+-    "max_auglag_inner_epochs": 2000,
++    "max_steps_auglag": 500,
++
+     "max_p_train_dropout": 0,
+     "reconstruction_loss_factor": 1.0,
+-    "anneal_entropy": "noanneal"
++    "anneal_entropy": "noanneal",
++    
++    
++    "patience":500,
++    "warm_up_step":100,
++    "reduce_lr_step":10
+   },
+   "lambda_sparse": 1
+ }
+\ No newline at end of file
+diff --git a/configs/rhino/model_config_rhino_weather_gaussian.json b/configs/rhino/model_config_rhino_weather_gaussian.json
+index 506fd2a..81dbe0c 100644
+--- a/configs/rhino/model_config_rhino_weather_gaussian.json
++++ b/configs/rhino/model_config_rhino_weather_gaussian.json
+@@ -3,30 +3,30 @@
+   "ICGNN_embedding_size": null,
+   "additional_spline_flow": 0,
+   "allow_instantaneous": false,
+-  "base_distribution_type": "gaussian",
++  "base_distribution_type":  "gaussian",
+   "cate_rff_lengthscale": [
+     0.1,
+     1
+   ],
+   "cate_rff_n_features": 3000,
+   "conditional_decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_embedding_size": null,
+   "conditional_encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "conditional_spline_order": "linear",
+   "decoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "disable_diagonal_eval": false,
+   "encoder_layer_sizes": [
+-    64,
+-    64
++    256,
++    256
+   ],
+   "imputation": false,
+   "init_logits": [
+@@ -36,7 +36,7 @@
+   "lag": 96,
+   "lambda_dag": 10,
+   "lambda_prior": 100000,
+-  "lambda_sparse": 1,
++  "lambda_sparse": 5,
+   "norm_layers": true,
+   "prior_A_confidence": 0.5,
+   "random_seed": 4,
+@@ -44,35 +44,51 @@
+   "spline_bins": 8,
+   "tau_gumbel": 0.25,
+   "var_dist_A_mode": "temporal_three",
+-  "pre_len": 336,
++  "pre_len": 96,
++  
++  "log_scale_init": -1.8,
++  
+   "configs":{
+-    "d_model" : 64,
++    "d_model" : 512,
++    "d_layers":1,
++
+     "e_layers" : 2,
+-    "num_kernels":
+-    "d_ff":
+-    "top_k":
+-    "dropout":
+-    "embed":
+-    "freq":
++    "num_kernels": 6,
++    "d_ff": 512,
++    "top_k": 5,
++    "dropout": 0.1,
++    "embed": "timeF",
++    
++    "freq": "h",
++    "factor":3,
++    "n_heads":8,
++    
++    "activation":"gelu",
++    "moving_avg":25,
++    "output_attention":false
+   }
+ },
+   "training_hyperparams": {
+-    "learning_rate": 0.001,
+-    "likelihoods_learning_rate": 0.001,
+-    "batch_size": 64,
++    "learning_rate": 1e-4,
++    "likelihoods_learning_rate": 1e-4,
++    "batch_size": 32,
+     "stardardize_data_mean": false,
+     "stardardize_data_std": false,
+     "rho": 1.0,
+     "safety_rho": 10000000000000.0,
+     "alpha": 0.0,
+     "safety_alpha": 10000000000000.0,
+-    "tol_dag": -1,
+     "progress_rate": 0.65,
+-    "max_steps_auglag": 20,
+-    "max_auglag_inner_epochs": 5000,
++    "max_steps_auglag": 500,
++
+     "max_p_train_dropout": 0,
+     "reconstruction_loss_factor": 1.0,
+-    "anneal_entropy": "noanneal"
++    "anneal_entropy": "noanneal",
++    
++    
++    "patience":15,
++    "warm_up_step":100,
++    "reduce_lr_step":10
+   },
+   "lambda_sparse": 1
+ }
+\ No newline at end of file

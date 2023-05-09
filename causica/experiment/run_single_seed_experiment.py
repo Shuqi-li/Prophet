@@ -5,6 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
+import nni
 
 import mlflow
 import psutil
@@ -96,6 +97,14 @@ class ExperimentArguments:
 
 
 def run_single_seed_experiment(args: ExperimentArguments):
+
+    optimized_params = nni.get_next_parameter()
+    
+    optimized_params_model = {k:v for k,v in optimized_params.items() if k in args.model_config}
+    optimized_params_train = {k:v for k,v in optimized_params.items() if k in args.train_hypers}
+    args.model_config.update(optimized_params_model)
+    args.train_hypers.update(optimized_params_train)
+
     # Set up loggers
     logger = logging.getLogger()
     log_format = "%(asctime)s %(filename)s:%(lineno)d[%(levelname)s]%(message)s"
@@ -153,6 +162,7 @@ def run_single_seed_experiment(args: ExperimentArguments):
             train_hypers=args.train_hypers,
             prior_path=args.prior_path,
             constraint_path=args.constraint_path,
+            infer_config=args.infer_config,
         )
         running_times["train/running-time"] = (time.time() - start_time) / 60
     save_json(args.dataset_config, os.path.join(model.save_dir, "dataset_config.json"))
@@ -161,12 +171,15 @@ def run_single_seed_experiment(args: ExperimentArguments):
     # Imputation
     if args.run_inference:
         assert args.infer_config is not None
-        run_eval_sample(
+        result = run_eval_sample(
             model=model,
             dataset=dataset,
             infer_config=args.infer_config,
             seed=args.dataset_seed if isinstance(args.dataset_seed, int) else args.dataset_seed[0],
         )
+        
+        #nni.report_final_result(result['test']['metric']['mse_mean'])
+
         # if not isinstance(model, IModelForImputation):
         #     raise ValueError("This model class does not support imputation.")
         # # TODO 18412: move impute_train_data flag into each dataset's imputation config rather than hardcoding here

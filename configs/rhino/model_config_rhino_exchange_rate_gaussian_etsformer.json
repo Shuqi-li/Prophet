@@ -1,0 +1,94 @@
+{
+  "model_hyperparams": {
+  "ICGNN_embedding_size": null,
+  "additional_spline_flow": 0,
+  "allow_instantaneous": false,
+  "base_distribution_type":  "gaussian",
+  "cate_rff_lengthscale": [
+    0.1,
+    1
+  ],
+  "cate_rff_n_features": 3000,
+  "conditional_decoder_layer_sizes": [
+    256,
+    256
+  ],
+  "conditional_embedding_size": null,
+  "conditional_encoder_layer_sizes": [
+    256,
+    256
+  ],
+  "conditional_spline_order": "linear",
+  "decoder_layer_sizes": [
+    256,
+    256
+  ],
+  "disable_diagonal_eval": false,
+  "encoder_layer_sizes": [
+    256,
+    256
+  ],
+  "imputation": false,
+  "init_logits": [
+    0,
+    0
+  ],
+  "lag": 96,
+  "lambda_dag": 10,
+  "lambda_prior": 100000,
+  "lambda_sparse": 5,
+  "norm_layers": true,
+  "prior_A_confidence": 0.5,
+  "random_seed": 4,
+  "res_connection": true,
+  "spline_bins": 8,
+  "tau_gumbel": 0.25,
+  "var_dist_A_mode": "temporal_three",
+  "pre_len": 96,
+  
+  "log_scale_init": -2.4,
+  
+  "configs":{
+    "d_model" : 512,
+    "d_layers":2,
+
+    "e_layers" : 2,
+    "num_kernels": 6,
+    "d_ff": 512,
+    "top_k": 5,
+    "dropout": 0.1,
+    "embed": "timeF",
+    
+    "freq": "h",
+    "factor":3,
+    "n_heads":8,
+    
+    "activation":"gelu",
+    "moving_avg":25,
+    "output_attention":false
+  }
+},
+  "training_hyperparams": {
+    "learning_rate": 1e-4,
+    "likelihoods_learning_rate": 1e-4,
+    "batch_size": 32,
+    "stardardize_data_mean": false,
+    "stardardize_data_std": false,
+    "rho": 1.0,
+    "safety_rho": 10000000000000.0,
+    "alpha": 0.0,
+    "safety_alpha": 10000000000000.0,
+    "progress_rate": 0.65,
+    "max_steps_auglag": 500,
+
+    "max_p_train_dropout": 0,
+    "reconstruction_loss_factor": 1.0,
+    "anneal_entropy": "noanneal",
+    
+    
+    "patience":500,
+    "warm_up_step":100,
+    "reduce_lr_step":10
+  },
+  "lambda_sparse": 1
+}

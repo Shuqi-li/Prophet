@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+from collections import defaultdict
 import networkx as nx
 import numpy as np
 import scipy
@@ -22,14 +22,24 @@ from ...utils.causality_utils import (
 )
 from ...utils.helper_functions import to_tensors
 from ...utils.nri_utils import convert_temporal_to_static_adjacency_matrix, edge_prediction_metrics_multisample
-from ..imodel import IModelForTimeseries
-from .base_distributions import TemporalConditionalSplineFlow
-from .deci import DECI
-from .generation_functions import TemporalContractiveInvertibleGNN, TemporalFGNNIwithTimesNet
+from ..imodel import (
+    IModelForTimeseries,
+)
+from ...models.torch_model import TorchModel
+from .base_distributions import (
+    BinaryLikelihood,
+    CategoricalLikelihood,
+    DiagonalFlowBase,
+    GaussianBase,
+    TemporalConditionalSplineFlow,
+)
+from .generation_functions import TemporalContractiveInvertibleGNN, TemporalFGNNIwithTimesNet, TemporalFGNNIwithInformer,TemporalFGNNIwithAutoformer, TemporalFGNNIwithESTformer
 from .variational_distributions import AdjMatrix, TemporalThreeWayGrahpDist
 from sklearn.preprocessing import StandardScaler
+from ...preprocessing.data_processor import DataProcessor
+import time
 
-class Rhino(DECI, IModelForTimeseries):
+class Rhino(TorchModel,IModelForTimeseries):
     """
     This class implements the AR-DECI model for end-to-end time series causal inference. It is inherited from the DECI class.
     One of the principle is to re-use as many code from the DECI as possible to avoid code repetition. For an overview of the design and
@@ -46,7 +56,6 @@ class Rhino(DECI, IModelForTimeseries):
         device: torch.device,
         lag: int,
         pre_len: int,
-        configs:Dict,
         allow_instantaneous: bool,
         imputation: bool = False,
         lambda_dag: float = 1.0,
@@ -65,7 +74,9 @@ class Rhino(DECI, IModelForTimeseries):
             0.1,
             1.0,
         ),
+        prior_A: Union[torch.Tensor, np.ndarray] = None,
         prior_A_confidence: float = 0.5,
+        prior_mask: Union[torch.Tensor, np.ndarray] = None,
         graph_constraint_matrix: Optional[np.ndarray] = None,
         ICGNN_embedding_size: Optional[int] = None,
         init_logits: Optional[List[float]] = None,
@@ -75,6 +86,11 @@ class Rhino(DECI, IModelForTimeseries):
         conditional_spline_order: str = "quadratic",
         additional_spline_flow: int = 0,
         disable_diagonal_eval: bool = True,
+        configs: Optional[Dict] = None,
+        log_scale_init: float =  -0.0,
+        dense_init: bool = False,
+        mode_adjacency: str = "learn",
+
     ):
         """
         Initialize the Rhino. Most of the parameters are from DECI class. For initialization, we first initialize the DECI class, and then
@@ -102,11 +118,13 @@ class Rhino(DECI, IModelForTimeseries):
         # Thus, the prior matrix will be set in run_train(), where datasest is one of the input. Here, we use None for prior_A.
         # For variational distribution and ICGNN, we overwrite the self._create_variational_distribution(...) and self._create_ICGNN(...)
         # to generate the correct type of var_dist and ICGNN.
-
+        self.mode_adjacency = mode_adjacency
         # Note that we may want to check if variables are all continuous.
         self.allow_instantaneous = allow_instantaneous
         self.init_logits = init_logits
         self.lag = lag
+        self.configs = configs
+
         self.cts_node = variables.continuous_idxs
         self.cts_dim = len(self.cts_node)
         # conditional spline flow hyper-params.
@@ -115,38 +133,61 @@ class Rhino(DECI, IModelForTimeseries):
         self.conditional_decoder_layer_sizes = conditional_decoder_layer_sizes
         self.conditional_spline_order = conditional_spline_order
         self.additional_spline_flow = additional_spline_flow
-        self.configs = configs
+
         
         # For V0 AR-DECI, we only support mode_adjacency="learn", so hardcoded this argument.
-        super().__init__(
-            model_id=model_id,
-            variables=variables,
-            save_dir=save_dir,
-            device=device,
-            imputation=imputation,
-            lambda_dag=lambda_dag,
-            lambda_sparse=lambda_sparse,
-            lambda_prior=lambda_prior,
-            tau_gumbel=tau_gumbel,
-            base_distribution_type=base_distribution_type,
-            spline_bins=spline_bins,
-            var_dist_A_mode=var_dist_A_mode,
-            imputer_layer_sizes=None,
-            mode_adjacency="learn",
-            norm_layers=norm_layers,
-            res_connection=res_connection,
-            encoder_layer_sizes=encoder_layer_sizes,
-            decoder_layer_sizes=decoder_layer_sizes,
-            cate_rff_n_features=cate_rff_n_features,
-            cate_rff_lengthscale=cate_rff_lengthscale,
-            prior_A=None,
-            prior_A_confidence=prior_A_confidence,
-            prior_mask=None,
-            graph_constraint_matrix=graph_constraint_matrix,
-            embedding_size=ICGNN_embedding_size,
-            disable_diagonal_eval=disable_diagonal_eval,
-            pre_len=pre_len
-        )
+        super().__init__(model_id, variables, save_dir, device)
+        self.disable_diagonal_eval = disable_diagonal_eval
+
+        self.base_distribution_type = base_distribution_type
+        self.dense_init = dense_init
+        self.embedding_size = ICGNN_embedding_size
+        self.device = device
+        self.lambda_dag = lambda_dag
+        self.lambda_sparse = lambda_sparse
+        self.lambda_prior = lambda_prior
+        self.log_scale_init = log_scale_init
+
+        self.cate_rff_n_features = cate_rff_n_features
+        self.cate_rff_lengthscale = cate_rff_lengthscale
+        self.tau_gumbel = tau_gumbel
+        self.encoder_layer_sizes = encoder_layer_sizes
+        self.decoder_layer_sizes = decoder_layer_sizes
+
+        # DECI treats *groups* as distinct nodes in the graph
+        self.num_nodes = variables.num_groups
+        self.processed_dim_all = variables.num_processed_non_aux_cols
+
+        # set up soft prior over graphs
+        self.set_prior_A(prior_A, prior_mask)
+        assert 0 <= prior_A_confidence <= 1
+        self.prior_A_confidence = prior_A_confidence
+
+        # Set up the Neural Nets
+        self.res_connection = res_connection
+        self.norm_layer = nn.LayerNorm if norm_layers else None
+        self.pre_len = pre_len
+        self.ICGNN = self._create_ICGNN_for_deci()
+
+        self.spline_bins = spline_bins
+        self.likelihoods = nn.ModuleDict(self._generate_error_likelihoods(self.base_distribution_type, self.variables))
+
+        self.variables = variables
+
+        self.imputation = imputation
+        if self.imputation:
+            self.all_cts = all(var.type_ == "continuous" for var in variables)
+            imputation_input_dim = 2 * self.processed_dim_all
+            imputation_output_dim = 2 * self.processed_dim_all
+            imputer_layer_sizes = imputer_layer_sizes or [max(80, imputation_input_dim)] * 2
+
+        self.var_dist_A = self._create_var_dist_A_for_deci(var_dist_A_mode)
+
+        # Adding a buffer to hold the log likelihood. This will be saved with the state dict.
+        self.register_buffer("log_p_x", torch.tensor(-np.inf))
+        self.log_p_x: torch.Tensor  # This is simply a scalar.
+        self.register_buffer("spline_mean_ewma", torch.tensor(0.0))
+        self.spline_mean_ewma: torch.Tensor
 
     def _generate_error_likelihoods(self, base_distribution_string: str, variables: Variables) -> Dict[str, nn.Module]:
         """
@@ -159,24 +200,64 @@ class Rhino(DECI, IModelForTimeseries):
         Returns:
             error_likelihood dict
         """
-        error_likelihoods = super()._generate_error_likelihoods(
-            base_distribution_string if base_distribution_string != "conditional_spline" else "spline",
-            variables,
-        )
+        base_distribution_string if base_distribution_string != "conditional_spline" else "spline",
 
-        if base_distribution_string == "conditional_spline":
-            error_likelihoods["continuous"] = TemporalConditionalSplineFlow(
-                cts_node=self.cts_node,
-                group_mask=torch.tensor(self.variables.group_mask).to(self.device),
-                device=self.device,
-                lag=self.lag,
-                num_bins=self.spline_bins,
-                additional_flow=self.additional_spline_flow,
-                layers_g=self.conditional_encoder_layer_sizes,
-                layers_f=self.conditional_decoder_layer_sizes,
-                embedding_size=self.conditional_embedding_size,
-                order=self.conditional_spline_order,
+        error_likelihoods: Dict[str, nn.Module] = {}
+        typed_regions = variables.processed_cols_by_type
+        # Continuous
+        continuous_range = [i for region in typed_regions["continuous"] for i in region]
+        if continuous_range:
+            dist: nn.Module
+            if base_distribution_string == "fixed_gaussian":
+                dist = GaussianBase(
+                    len(continuous_range),
+                    device=self.device,
+                    train_base=False,
+                    log_scale_init=self.log_scale_init,
+                )
+            elif base_distribution_string == "gaussian":
+                dist = GaussianBase(
+                    len(continuous_range),
+                    device=self.device,
+                    train_base=True,
+                    log_scale_init=self.log_scale_init,
+                )
+            elif base_distribution_string == "spline":
+                dist = DiagonalFlowBase(
+                    len(continuous_range),
+                    device=self.device,
+                    num_bins=self.spline_bins,
+                    flow_steps=1,
+                )
+            elif base_distribution_string == "conditional_spline":
+                dist = TemporalConditionalSplineFlow(
+                    cts_node=self.cts_node,
+                    group_mask=torch.tensor(self.variables.group_mask).to(self.device),
+                    device=self.device,
+                    lag=self.lag,
+                    num_bins=self.spline_bins,
+                    additional_flow=self.additional_spline_flow,
+                    layers_g=self.conditional_encoder_layer_sizes,
+                    layers_f=self.conditional_decoder_layer_sizes,
+                    embedding_size=self.conditional_embedding_size,
+                    order=self.conditional_spline_order,
+                )
+            else:
+                raise NotImplementedError("Base distribution type not recognised")
+            error_likelihoods["continuous"] = dist
+
+        # Binary
+        binary_range = [i for region in typed_regions["binary"] for i in region]
+        if binary_range:
+            error_likelihoods["binary"] = BinaryLikelihood(len(binary_range), device=self.device)
+
+        # Categorical
+        if "categorical" in typed_regions:
+            error_likelihoods["categorical"] = nn.ModuleList(
+                [CategoricalLikelihood(len(region), device=self.device) for region in typed_regions["categorical"]]
             )
+
+
         return error_likelihoods
 
     def _create_var_dist_A_for_deci(self, var_dist_A_mode: str) -> Optional[AdjMatrix]:
@@ -224,13 +305,35 @@ class Rhino(DECI, IModelForTimeseries):
         #     embedding_size=self.embedding_size,
         #     pre_len=self.pre_len
         # )
-
+        #timesnet
         return TemporalFGNNIwithTimesNet(
             group_mask=torch.tensor(self.variables.group_mask),
             lag=self.lag,
             configs= self.configs,
             pre_len = self.pre_len
         ).to(self.device)
+        #informer
+        # return TemporalFGNNIwithInformer(
+        #     group_mask=torch.tensor(self.variables.group_mask),
+        #     lag=self.lag,
+        #     configs= self.configs,
+        #     pre_len = self.pre_len
+        # ).to(self.device)
+        # autoformer
+        # return TemporalFGNNIwithAutoformer(
+        #     group_mask=torch.tensor(self.variables.group_mask),
+        #     lag=self.lag,
+        #     configs= self.configs,
+        #     pre_len = self.pre_len
+        # ).to(self.device)
+        #ESTformer
+        # return TemporalFGNNIwithESTformer(
+        #     group_mask=torch.tensor(self.variables.group_mask),
+        #     lag=self.lag,
+        #     configs= self.configs,
+        #     pre_len = self.pre_len
+        # ).to(self.device)
+ 
     
     def networkx_graph(self) -> nx.DiGraph:
         """
@@ -275,30 +378,6 @@ class Rhino(DECI, IModelForTimeseries):
     def name(cls) -> str:
         return "rhino"
 
-    def set_graph_constraint(self, graph_constraint_matrix: Optional[np.ndarray]):
-        """
-        This method overwrite the original set_graph_constraint method in DECI class, s.t. it supports the temporal
-        graph constraints. For the meaning of value in each constraint matrix, please refer to the DECI class docstring.
-        Args:
-            graph_constraint_matrix: temporal graph constraints matrix with shape [lag+1, num_nodes, num_nodes] or None.
-        """
-        # The implementation is very similar to the original one in DECI class. The difference is that for neg_constraint_matrix
-        # we need to disable the diagonal elements of constraint[0, ...] rather than the entire constraint matrix in original DECI.
-        # Also the original implementation only supports 2D matrix.
-        if graph_constraint_matrix is None:
-            neg_constraint_matrix = np.ones((self.lag , self.num_nodes, self.num_nodes))
-            self.neg_constraint_matrix = torch.as_tensor(neg_constraint_matrix, device=self.device, dtype=torch.float32)
-            self.pos_constraint_matrix = torch.zeros((self.lag, self.num_nodes, self.num_nodes), device=self.device)
-        else:
-            negative_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=1.0)
-            self.neg_constraint_matrix = torch.as_tensor(
-                negative_constraint_matrix, device=self.device, dtype=torch.float32
-            )
-            # Disable diagonal elements in the instant graph constraint.
-            positive_constraint_matrix = np.nan_to_num(graph_constraint_matrix, nan=0.0)
-            self.pos_constraint_matrix = torch.as_tensor(
-                positive_constraint_matrix, device=self.device, dtype=torch.float32
-            )
 
     def _log_prob(
         self,
@@ -445,7 +524,6 @@ class Rhino(DECI, IModelForTimeseries):
         intervention_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
         samples_per_graph_groups: int = 1,
         X_history: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        time_span: int = 1,
     ) -> torch.Tensor:
         """
         This method samples the observations for the AR-DECI model. For V0, due to the lack of source node model, one has to provide
@@ -517,7 +595,7 @@ class Rhino(DECI, IModelForTimeseries):
      
 
             Z = self._sample_base(
-                    samples_per_graph_groups * N_history_batch, time_span=time_span
+                    samples_per_graph_groups * N_history_batch, time_span=self.pre_len
                 ) # [batch*samples_per_graph, time_span, proc_dim]
 
 
@@ -527,7 +605,7 @@ class Rhino(DECI, IModelForTimeseries):
             # Iterate over graph samples
             if intervention_mask is not None and intervention_values is not None:
                 assert (
-                    time_span >= intervention_mask.shape[0]
+                    self.pre_len >= intervention_mask.shape[0]
                 ), "The future ahead time for observation generation must be >= the ahead time for intervention"
                 # Convert the time_length in intervention mask to be compatible with X_all
                 false_matrix_conditioning = torch.full(X_history.shape[1:], False, dtype=torch.bool, device=self.device)
@@ -549,16 +627,16 @@ class Rhino(DECI, IModelForTimeseries):
 
                 # Generate the observations based on the history (given history + previously-generated observations)
                 # and exogenous noise Z.
-                predict = self.ICGNN.f.feed_forward(X_history[:, -self.lag:], W_adj=W_adj).transpose(-1, -2) #batch, time_span nodes
+                predict = self.ICGNN.predict(X_history[:, -self.lag:], W_adj=W_adj) #batch, time_span nodes
     
                 X_simulate_total.append(predict) #samples_per_graph*batch, time_span pro_dim
 
     
             predict_f = (
-                torch.cat(X_simulate_total, dim=0).view(-1, N_history_batch, time_span, proc_dim)
+                torch.cat(X_simulate_total, dim=0).view(-1, N_history_batch, self.pre_len, proc_dim)
             )  # shape [num_graph_samples, N_history_batch, time_span, proc_dim]
-            samples = predict_f
-            # samples = (predict_f.unsqueeze(0) + Z.view(-1, N_history_batch, time_span, proc_dim).unsqueeze(1)).view(-1, N_history_batch, time_span, proc_dim)
+            # samples = predict_f
+            samples = (predict_f.unsqueeze(0) + Z.view(-1, N_history_batch, self.pre_len, proc_dim).unsqueeze(1)).view(-1, N_history_batch, self.pre_len, proc_dim)
             # else:
 
             #     # Sample weighted graph from posterior with shape [num_graph_samples, lag+1, num_nodes, num_nodes]
@@ -606,44 +684,6 @@ class Rhino(DECI, IModelForTimeseries):
 
         return samples
 
-    def log_prob(
-        self,
-        X: torch.Tensor,
-        Nsamples_per_graph: int = 100,
-        most_likely_graph: bool = False,
-        intervention_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
-        intervention_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
-    ) -> np.ndarray:
-        """
-        This computes the log probability of the observations. For V0, does not support intervention.
-        Most part is just a copy of parent method, the only difference is that for "conditional_spline", we need to pass
-        W to self._log_prob.
-        Args:
-            X: The observation with shape [N_batch, lag+1, proc_dims]
-            Nsamples_per_graph: The number of graph samples.
-            most_likely_graph: whether to use the most likely graph. If true, Nsamples should be 1.
-            intervention_idxs: Currently not support
-            intervention_values: Currently not support
-
-        Returns: a numpy with shape [N_batch]
-
-        """
-        # Assert for X shape
-        assert X.dim() == 3, "X should be of shape [N_batch, lag+1, proc_dims]"
-        # Assertions: intervention_idxs and intervention_values must be None for V0.
-        assert intervention_idxs is None, "intervention_idxs is not supported for V0"
-        assert intervention_values is None, "intervention_values is not supported for V0"
-        # Assertions: Nsamples_per_graph must be 1 if most_likely_graph is true.
-        if most_likely_graph:
-            assert Nsamples_per_graph == 1, "Nsamples_per_graph should be 1 if most_likely_graph is true"
-
-        return super().log_prob(
-            X=X,
-            Nsamples_per_graph=Nsamples_per_graph,
-            most_likely_graph=most_likely_graph,
-            intervention_idxs=intervention_idxs,
-            intervention_values=intervention_values,
-        )
 
     def get_params_variational_distribution(
         self, x: torch.Tensor, mask: torch.Tensor
@@ -673,6 +713,24 @@ class Rhino(DECI, IModelForTimeseries):
         For V0, we do not support missing values, so there is no imputer. Raise NotImplementedError for now.
         """
         raise NotImplementedError
+   
+    def cate(
+        self,
+        intervention_idxs: Union[torch.Tensor, np.ndarray],
+        intervention_values: Union[torch.Tensor, np.ndarray],
+        reference_values: Optional[np.ndarray] = None,
+        effect_idxs: Optional[np.ndarray] = None,
+        conditioning_idxs: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        conditioning_values: Optional[Union[torch.Tensor, np.ndarray]] = None,
+        Nsamples_per_graph: int = 1,
+        Ngraphs: Optional[int] = 1000,
+        most_likely_graph: bool = False,
+        fixed_seed: Optional[int] = None,
+    ):
+        """
+        Evaluate (optionally conditional) average treatment effect given the learnt causal model.
+        """
+        raise NotImplementedError
 
     def process_dataset(
         self,
@@ -686,7 +744,18 @@ class Rhino(DECI, IModelForTimeseries):
         we have the support for missing values.
         """
         # Call super().process_dataset to generate data and mask
-        data, mask = super().process_dataset(dataset, train_config_dict, variables)
+        if variables is None:
+            variables = self.variables
+
+        self.data_processor = DataProcessor(
+            variables,
+            unit_scale_continuous=False,
+            standardize_data_mean=train_config_dict.get("standardize_data_mean", False),
+            standardize_data_std=train_config_dict.get("standardize_data_std", False),
+        )
+        processed_dataset = self.data_processor.process_dataset(dataset)
+        data, mask = processed_dataset.train_data_and_mask
+        data = data.astype(np.float32)
         # Assert mask is all 1.
         assert np.all(mask == 1)
         return data, mask
@@ -752,29 +821,30 @@ class Rhino(DECI, IModelForTimeseries):
             num_samples: The size of the training data set.
         """
         # The implementation is identical to the one in FT-DECI but with is_autoregressive=True.
+        val_data=None
+
         dataloader = {
             'val':{},
             'test':{}
         }
         batch_size = infer_config_dict['batch_size']
-        time_span = infer_config_dict['time_span']
         processed_dataset = self.data_processor.process_dataset(dataset)
         train_data, _ = processed_dataset.train_data_and_mask
         scaler = StandardScaler()
         scaler.fit(train_data)
-        val_data, _ = processed_dataset.val_data_and_mask
-        val_data = scaler.transform(val_data)
+        # val_data, _ = processed_dataset.val_data_and_mask
+        # val_data = scaler.transform(val_data)
         test_data, _ = processed_dataset.test_data_and_mask
         test_data = scaler.transform(test_data)
         # dataloader['train']['data_len'] = len(train_data)
-        # dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation, time_span)
+        # dataloader['train']['loader'] = self.my_data_loader(train_data, batch_size, dataset.train_segmentation, self.pre_len)
         
         if val_data is not None:
             dataloader['val']['data_len'] = len(val_data)
-            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation, time_span)
+            dataloader['val']['loader'] = self.my_data_loader(val_data, batch_size, dataset._val_segmentation, self.pre_len)
         if test_data is not None:
             dataloader['test']['data_len'] = len(test_data)
-            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation, time_span)
+            dataloader['test']['loader'] = self.my_data_loader(test_data, batch_size, dataset._test_segmentation, self.pre_len)
         return dataloader
 
     def set_prior_A(
@@ -837,22 +907,42 @@ class Rhino(DECI, IModelForTimeseries):
     ) -> Tuple[Union[DataLoader, TemporalTensorDataset], int]:
 
         processed_dataset = self.data_processor.process_dataset(dataset)
-        val_data, val_mask = processed_dataset.val_data_and_mask
-        val_dataset = TemporalTensorDataset(
-            *to_tensors(val_data, val_mask, device=self.device),
+        train_data, _ = processed_dataset.train_data_and_mask
+        scaler = StandardScaler()
+        scaler.fit(train_data)
+        # change tag
+        val_data, val_mask = processed_dataset.test_data_and_mask
+        #val_data_and_mask
+        val_data = scaler.transform(val_data)
+        val_dataset = MyTemporalTensorDataset(
+            *to_tensors(val_data, device=self.device),
             lag=self.lag,
             is_autoregressive=True,
-            index_segmentation=dataset.get_val_segmentation(),
+            index_segmentation=dataset._test_segmentation,
         )
+        #dataset.get_val_segmentation(),
         val_dataloader = DataLoader(val_dataset, batch_size=train_config_dict["batch_size"], shuffle=True)
 
         return val_dataloader, len(val_dataset)
+    
+    def print_tracker(self, inner_step: int, tracker: dict) -> None:
+        """Prints formatted contents of loss terms that are being tracked."""
+        tracker_copy = tracker.copy()
+
+        out = (
+            f"Inner Step: {inner_step}"
+        )
+
+        for k, v in tracker_copy.items():
+            out += f", {k}: {np.mean(v[-100:]):.4f}"
+
+        print(out)
 
     def run_train(
         self,
         dataset: Dataset,
         train_config_dict: Optional[Dict[str, Any]] = None,
-        report_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        infer_config_dict: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         This method implements the training scripts of AR-DECI. This also setup a soft prior (if exists) for the AR-DECI.
@@ -878,11 +968,114 @@ class Rhino(DECI, IModelForTimeseries):
         # Inner loop by calling self.optimize_inner_auglag(...). No change is needed.
         # Update rho, alpha, loss tracker (similar to DECI).
         assert train_config_dict["max_p_train_dropout"] == 0.0, "Current AR-DECI does not support missing values."
-        super().run_train(
-            dataset,
-            train_config_dict=train_config_dict,
-            report_progress_callback=report_progress_callback,
-        )
+
+        dataloader, num_samples = self._create_dataset_for_deci(dataset, train_config_dict)
+
+        # create dataloader for validation
+        if dataset.has_val_data:
+            # get processed dataset
+            val_dataloader, _ = self._create_val_dataset_for_deci(dataset, train_config_dict)
+
+        # initialise logging machinery
+        train_output_dir = os.path.join(self.save_dir, "train_output")
+        os.makedirs(train_output_dir, exist_ok=True)
+        log_path = os.path.join(train_output_dir, "summary")
+        print("Saving logs to", log_path)
+
+
+        base_lr = train_config_dict["learning_rate"]
+        patience =  train_config_dict["patience"]
+
+        # This allows the setting of the starting learning rate of each of the different submodules in the config, e.g. "likelihoods_learning_rate".
+        parameter_list = [
+            {
+                "params": module.parameters(),
+                "lr": train_config_dict.get(f"{name}_learning_rate", base_lr),
+                "name": name,
+            }
+            for name, module in self.named_children()
+        ] 
+
+
+        def get_lr():
+            for param_group in self.opt.param_groups:
+                return param_group["lr"]
+
+        def set_lr(factor):
+            for param_group in self.opt.param_groups:
+                param_group["lr"] = param_group["lr"] * factor
+
+        def initialize_lr():
+            base_lr = train_config_dict["learning_rate"]
+            for param_group in self.opt.param_groups:
+                name = param_group["name"]
+                param_group["lr"] = train_config_dict.get(f"{name}_learning_rate", base_lr)
+
+        self.opt = torch.optim.Adam(parameter_list)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max = train_config_dict['warm_up_step'])
+
+        best_log_p_x = -np.inf
+        best_mse = np.inf
+        outer_step_start_time =None
+        count = 0
+        batch_size = train_config_dict['batch_size']
+        for step in range(train_config_dict["max_steps_auglag"]):
+            count += 1
+            # Inner loop
+            print("LR:", get_lr())
+            print(f"Auglag Epoch: {step}")
+            tracker_loss_terms: Dict = defaultdict(list)
+            inner_step = 0
+            for x, _ in dataloader:
+                loss, tracker_loss_terms = self.compute_loss(
+                    step,
+                    x,
+                    num_samples,
+                    tracker_loss_terms,
+                    train_config_dict
+                )
+                inner_step += 1
+
+                loss = loss*batch_size/32
+                loss.backward()
+                # 梯度累计
+                if batch_size * inner_step % 32 == 0:
+                    self.opt.step()
+                    self.opt.zero_grad()
+
+                    log_step = len(str(round(num_samples/32)))-1
+                    if round(num_samples/32)/(log_step*10.) <= 1:
+                        log_step = log_step +1
+
+                    if int(inner_step) % (log_step*10) == 0:
+                        self.print_tracker(inner_step, tracker_loss_terms)
+
+            print(f" Epoch Steps: {inner_step}")   
+            mse_sample = self.run_inference_with_dataloader(val_dataloader, infer_config_dict)
+            val_mse = mse_sample.mean()
+            if val_mse < best_mse:
+                self.save(best=True)
+                print(f"Saved new best checkpoint with {val_mse} instead of {best_mse}")
+                best_mse = val_mse
+                count = 0
+
+            
+            if outer_step_start_time!=None:
+                outer_step_time = time.time() - outer_step_start_time
+                print("Time taken for this epoch", outer_step_time)
+     
+            outer_step_start_time = time.time()
+
+            self.scheduler.step()
+            # adjust_learning_rate
+            # if step%train_config_dict['reduce_lr_step'] ==0:
+            #     set_lr(0.1)
+            # if step%train_config_dict['warm_up_step']  ==0:
+            #     initialize_lr()
+            # # early stop
+            # if count > patience:
+            #     break
+        self.save()
 
     def run_inference(self, dataset, infer_config_dict):
         dataloader = self._create_dataset_for_sample(dataset, infer_config_dict)
@@ -893,34 +1086,36 @@ class Rhino(DECI, IModelForTimeseries):
         }
 
         for k, item in dataloader.items():
+            if item == {}:
+                continue
             total_metric[k]['data_num'] = item['data_len']
             metric={}
-            mse_sample = None
+
             # acc_sample = None
             # acc_mask = None
             # target_all = None
             # predicts_all = None
-            for x_, target_ in item['loader']:
-                x=x_[0] #batch lag nodes
-                pre_value = x[:,-1].clone() #batch node
-                # #normalize
-                # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
-                # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
-                # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
-                # x = (x - x_mean)/x_std
+            mse_sample = self.run_inference_with_dataloader(item['loader'], infer_config_dict)
+            # for x_, target_ in item['loader']:
+            #     x=x_[0] #batch lag nodes
+            #     pre_value = x[:,-1].clone() #batch node
+            #     # #normalize
+            #     # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
+            #     # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
+            #     # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
+            #     # x = (x - x_mean)/x_std
 
-                target=target_[0] # batch time_span nodes
-                predicts = self.sample(X_history=x,
-                                    Nsamples=infer_config_dict['Nsamples'],
-                                    most_likely_graph=infer_config_dict['most_likely_graph'],
-                                    intervention_idxs=infer_config_dict['intervention_idxs'],
-                                    intervention_values=infer_config_dict['intervention_values'],
-                                    samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'],
-                                    time_span = infer_config_dict['time_span'])
+            #     target=target_[0] # batch time_span nodes
+            #     predicts = self.sample(X_history=x,
+            #                         Nsamples=infer_config_dict['Nsamples'],
+            #                         most_likely_graph=infer_config_dict['most_likely_graph'],
+            #                         intervention_idxs=infer_config_dict['intervention_idxs'],
+            #                         intervention_values=infer_config_dict['intervention_values'],
+            #                         samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'])
                 
-                mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
+            #     mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
 
-                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
+            #     mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
     
                 # target_all = torch.cat([target_all,target], dim = 0) if target_all != None else target
                 # predicts_all = torch.cat([predicts_all,predicts], dim = 1) if predicts_all != None else predicts
@@ -929,7 +1124,7 @@ class Rhino(DECI, IModelForTimeseries):
             #     target_all[..., i] = normalizer.inverse_transform(target_all[[..., i]])
             #     predicts_all[..., i] = normalizer.inverse_transform(predicts_all[..., i])
             
-           
+            
 
                 # renormalize
                 # predicts = self.scaler.inverse_transform(predicts)
@@ -975,11 +1170,34 @@ class Rhino(DECI, IModelForTimeseries):
             
             total_metric[k]['metric']=metric
 
-                    
-
-
         return total_metric
 
+    def run_inference_with_dataloader(self, dataloader, infer_config_dict):
+        mse_sample = None
+        for x_, target_ in dataloader:
+                x=x_[0] #batch lag nodes
+                pre_value = x[:,-1].clone() #batch node
+                # #normalize
+                # x_mean = x.mean(1).unsqueeze(1) #batch 1 nodes
+                # x_std = torch.clamp(x.std(1).unsqueeze(1),min=1e-8)
+                # # # x = torch.where(x_std==0,(x-x_mean)/x_std, x-x_mean)
+                # x = (x - x_mean)/x_std
+
+                target=target_[0] # batch time_span nodes
+                predicts = self.sample(X_history=x,
+                                    Nsamples=infer_config_dict['Nsamples'],
+                                    most_likely_graph=infer_config_dict['most_likely_graph'],
+                                    intervention_idxs=infer_config_dict['intervention_idxs'],
+                                    intervention_values=infer_config_dict['intervention_values'],
+                                    samples_per_graph_groups=infer_config_dict['samples_per_graph_groups'])
+                
+                mse_sample_ = (target-predicts).pow(2).mean(-2) # samples, batch, nodes
+
+                mse_sample = torch.cat([mse_sample,mse_sample_], dim=1) if mse_sample!=None else mse_sample_
+    
+                # target_all = torch.cat([target_all,target], dim = 0) if target_all != None else target
+                # predicts_all = torch.cat([predicts_all,predicts], dim = 1) if predicts_all != None else predicts
+        return  mse_sample
 
 
     def get_adj_matrix_tensor(
@@ -1008,7 +1226,7 @@ class Rhino(DECI, IModelForTimeseries):
             )
         else:
             raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
-        return self._apply_constraints(adj)
+        return adj
 
 
     def get_adj_matrix(
@@ -1045,13 +1263,33 @@ class Rhino(DECI, IModelForTimeseries):
         """
         A_samples = self.get_adj_matrix_tensor(x_history, do_round, samples, most_likely_graph)
 
-        W_adjs = A_samples * self.ICGNN.get_weighted_adjacency().unsqueeze(0)
+        W_adjs = A_samples # * self.ICGNN.get_weighted_adjacency().unsqueeze(0)
 
         if squeeze and samples == 1:
             W_adjs = W_adjs.squeeze(0)
 
         return W_adjs
     
+    def _log_prior_A(self, A: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the prior for adjacency matrix A, which consitst on a term encouraging DAGness
+        and another encouraging sparsity (see https://arxiv.org/pdf/2106.07635.pdf).
+
+        Args:
+            A: Adjancency matrix of shape (input_dim, input_dim), binary.
+
+        Returns:
+            Log probability of A for prior distribution, a number.
+        """
+
+        sparse_term = -self.lambda_sparse * A.abs().sum()
+        if self.exist_prior:
+            prior_term = (
+                -self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
+            )
+            return sparse_term + prior_term
+        else:
+            return sparse_term
 
     def _ELBO_terms(self, X: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -1076,11 +1314,11 @@ class Rhino(DECI, IModelForTimeseries):
             factor_q = 0.0
         else:
             raise NotImplementedError(f"Adjacency mode {self.mode_adjacency} not implemented")
- 
-        W_adj = A_sample * self.ICGNN.get_weighted_adjacency()  #[batch, lag, nodes, nodes]
-        predict = self.ICGNN.predict(x_history, W_adj).transpose(-1,-2)  # batch pre_len nodes
-        log_p_A = self._log_prior_A(A_sample)  # A number
+        
 
+        W_adj = A_sample # * self.ICGNN.get_weighted_adjacency()  #[batch, lag, nodes, nodes]
+        predict = self.ICGNN.predict(x_history, W_adj)  # batch pre_len nodes
+        log_p_A = self._log_prior_A(A_sample)  # A number
         
         log_p_base = self._log_prob(
                 X,
@@ -1089,7 +1327,7 @@ class Rhino(DECI, IModelForTimeseries):
             )  # (B)
 
             # self.ICGNN.predict(X, W_adj)
-        log_q_A = self.var_dist_A.entropy()  # A number
+        log_q_A = -self.var_dist_A.entropy()  # A number
         
 
         # renormalize
@@ -1108,15 +1346,9 @@ class Rhino(DECI, IModelForTimeseries):
         self,
         step: int,
         x: torch.Tensor,
-        mask_train_batch: torch.Tensor,
-        input_mask: torch.Tensor,
         num_samples: int,
         tracker: Dict,
         train_config_dict: Dict[str, Any],
-        alpha: float = None,
-        rho: float = None,
-        adj_true: Optional[np.ndarray] = None,
-        compute_cd_fscore: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict]:
         """Computes the loss and updates trackers of different terms.
@@ -1151,15 +1383,19 @@ class Rhino(DECI, IModelForTimeseries):
 
 
         if train_config_dict["anneal_entropy"] == "linear":
-            ELBO = log_p_term  - log_q_A_term / max(step - 5, 1) #-  log_p_A_term
+            ELBO = log_p_term  - log_q_A_term / max(step - 5, 1) +  log_p_A_term/max(step - 5, 1) 
         elif train_config_dict["anneal_entropy"] == "noanneal":
-            ELBO = log_p_term  - log_q_A_term #- log_p_A_term
+            ELBO = log_p_term  - log_q_A_term + log_p_A_term / max(step - 5, 1) 
+        print('elbo', ELBO)
+        input()
         loss = -ELBO
 
 
         tracker["loss"].append(loss.item())
         
         # loss = loss +  cts_mse
+                #change
+
 
         tracker["log_p_A_sparse"].append(log_p_A_term.item())
         tracker["log_p_x"].append(log_p_term.item())

@@ -1,0 +1,6 @@
+artifact_location: file:///data/shuqili/nni_causica/mlruns/7
+creation_time: 1683510102135
+experiment_id: '7'
+last_update_time: 1683510102135
+lifecycle_stage: active
+name: weather.rhino_informer

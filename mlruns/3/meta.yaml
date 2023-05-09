@@ -1,0 +1,6 @@
+artifact_location: file:///data/shuqili/nni_causica/mlruns/3
+creation_time: 1683409330923
+experiment_id: '3'
+last_update_time: 1683409330923
+lifecycle_stage: active
+name: exchange_rate.rhino_autoformer

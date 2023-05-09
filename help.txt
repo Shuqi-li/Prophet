@@ -1,0 +1,22 @@
+调参运行注意:
+每个nni_exp文件的端口号和卡号需不一样， 卡号：CUDA_VISIBLE_DEVICES=6 
+如果nni设置多卡，应该卡号可以不用设置(可以看一下nni教程)
+对各个数据集的处理:
+nodes多的数据集需要在model_config中修改batch_size。实验的并行数也得修改，
+可以拿命令单独跑一下看看GPU占用，估计一下
+CUDA_VISIBLE_DEVICES=1  python -m causica.run_experiment exchange_rate --model_type rhino -dc configs/dataset_config_temporal_causal_dataset_all.json --model_config configs/rhino/model_config_rhino_exchange_rate_gaussian.json -dv gpu -i -ifc infer_config_temporal_causal_dataset.json
+experiment.config.trial_concurrency = 1
+
+
+调参中的命令:
+--model_config 每个数据对应的模型参数在 configs/rhino下，带guassian后缀的。ETT数据的json未创建
+model_config中有一个configs的Dict数据中的 d_model, 需要根据数据集的节点数求。
+
+-dc 数据处理的参数在configs下，文件名叫
+除了ETT的其他数据使用：/data/shuqili/nni_causica/configs/dataset_config_temporal_causal_dataset_all.json
+ETT: /data/shuqili/nni_causica/configs/dataset_config_temporal_causal_dataset_ett.json
+
+如果需要对训练好的模型进行inference，则在runs/中的数据集对应的适用中复制到model_id的路径。
+例子:
+CUDA_VISIBLE_DEVICES=1  python -m causica.run_experiment exchange_rate --model_type rhino -dc configs/dataset_config_temporal_causal_dataset_all.json --model_dir /runs/exchange_rate.rhino/2023-05-05_160526/d6e04c49-9dfd-4e3e-8b5f-c8e4de4e0b7e -dv gpu -i -ifc infer_config_temporal_causal_dataset.json
+

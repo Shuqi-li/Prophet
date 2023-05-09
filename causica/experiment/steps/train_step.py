@@ -2,6 +2,7 @@ from logging import Logger
 from typing import Any, Dict, Optional, Union
 
 import mlflow
+import nni
 
 from ...datasets.dataset import Dataset, SparseDataset
 from ...datasets.variables import Variables
@@ -19,6 +20,7 @@ def run_train_main(
     device: str,
     model_config: Dict[str, Any],
     train_hypers: Dict[str, Any],
+    infer_config: Dict[str, Any],
     prior_path: Optional[str] = None,
     constraint_path: Optional[str] = None,
 ) -> IModel:
@@ -44,6 +46,8 @@ def run_train_main(
     logger.info("Training model.")
 
     # TODO fix typing. mypy rightly complains that we may pass SparseDataset to a model that can only handle (dense) Dataset here.
-    model.run_train(dataset=dataset, train_config_dict=train_hypers)  # type: ignore
+    best_mse = model.run_train(dataset=dataset, train_config_dict=train_hypers, infer_config_dict=infer_config)  # type: ignore
+
+    nni.report_final_result(best_mse)
 
     return model

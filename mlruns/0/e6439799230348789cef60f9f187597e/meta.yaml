@@ -1,0 +1,15 @@
+artifact_uri: file:///data/shuqili/nni_causica/mlruns/0/e6439799230348789cef60f9f187597e/artifacts
+end_time: 1683479811664
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: e6439799230348789cef60f9f187597e
+run_name: exchange_rate.rhino_informer
+run_uuid: e6439799230348789cef60f9f187597e
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1683479778486
+status: 4
+tags: []
+user_id: shuqili

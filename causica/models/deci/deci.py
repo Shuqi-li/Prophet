@@ -106,7 +106,7 @@ class DECI(
         graph_constraint_matrix: Optional[np.ndarray] = None,
         dense_init: bool = False,
         embedding_size: Optional[int] = None,
-        log_scale_init: float =  -10.0,
+        log_scale_init: float =  -0.0,
         disable_diagonal_eval: bool = True,
         pre_len:int = 1,
     ):
@@ -533,10 +533,10 @@ class DECI(
             Log probability of A for prior distribution, a number.
         """
 
-        sparse_term = self.lambda_sparse * A.abs().sum()
+        sparse_term = -self.lambda_sparse * A.abs().sum()
         if self.exist_prior:
             prior_term = (
-                self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
+                -self.lambda_prior * (self.prior_mask * (A - self.prior_A_confidence * self.prior_A)).abs().sum()
             )
             return sparse_term + prior_term
         else:
@@ -1299,11 +1299,15 @@ class DECI(
             ELBO = log_p_term + imputation_entropy + log_p_A_term - log_q_A_term - penalty_dag_term
         loss = -ELBO + avg_reconstruction_err * train_config_dict["reconstruction_loss_factor"]
 
+        
+        #change
+
         if adj_true is not None and compute_cd_fscore:
             adj_pred = self.get_adj_matrix().astype(float).round()
             results = edge_prediction_metrics_multisample(adj_true, adj_pred, adj_matrix_mask=None)
             tracker["cd_fscore"].append(results["adjacency_fscore"])
 
+        
         tracker["loss"].append(loss.item())
         tracker["penalty_dag"].append(elbo_terms["penalty_dag"].item())
         tracker["penalty_dag_weighed"].append(penalty_dag_term.item())
@@ -1430,7 +1434,7 @@ class DECI(
         self,
         dataset: Dataset,
         train_config_dict: Optional[Dict[str, Any]] = None,
-        report_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        infer_config_dict: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Runs training.
@@ -1439,7 +1443,7 @@ class DECI(
             train_config_dict = {}
 
         # Tracker for the best logprob during training
-        best_log_p_x = -np.inf
+        
 
         dataloader, num_samples = self._create_dataset_for_deci(dataset, train_config_dict)
 
@@ -1455,17 +1459,9 @@ class DECI(
         writer = SummaryWriter(log_path, flush_secs=1)
         print("Saving logs to", log_path)
 
-        rho = train_config_dict["rho"]
-        alpha = train_config_dict["alpha"]
-        progress_rate = train_config_dict["progress_rate"]
-        base_beta = train_config_dict["beta"] if "beta" in train_config_dict else 1.0
+
         base_lr = train_config_dict["learning_rate"]
-        anneal_beta = train_config_dict["anneal_beta"] if "anneal_beta" in train_config_dict else None
-        anneal_beta_max_steps = (
-            train_config_dict["anneal_beta_max_steps"]
-            if "anneal_beta_max_steps" in train_config_dict
-            else int(train_config_dict["max_steps_auglag"] / 2)
-        )
+        patience =  train_config_dict["patience"]
 
         # This allows the setting of the starting learning rate of each of the different submodules in the config, e.g. "likelihoods_learning_rate".
         parameter_list = [
@@ -1475,243 +1471,20 @@ class DECI(
                 "name": name,
             }
             for name, module in self.named_children()
-        ]
+        ] 
+
+
 
         self.opt = torch.optim.Adam(parameter_list)
 
-        # Outer optimization loop
-        base_idx = 0
-        dag_penalty_prev = float("inf")
-        num_below_tol = 0
-        num_max_rho = 0
-        num_not_done = 0
-        if isinstance(dataset, TemporalDataset):
-            # Metrics dict, this is only used for AR-DECI
-            metrics_dict: dict = {}
+        best_log_p_x = -np.inf
+        best_mse = np.inf
+        outer_step_start_time =None
+        count = 0
         for step in range(train_config_dict["max_steps_auglag"]):
-
-            # Stopping if DAG conditions satisfied
-            patience_dag_reached = train_config_dict.get("patience_dag_reached", 5)
-            patience_max_rho = train_config_dict.get("patience_max_rho", 3)
-            if num_below_tol >= patience_dag_reached:
-                print(f"DAG penalty below tolerance for more than {patience_dag_reached} steps")
-                break
-            elif num_max_rho >= patience_max_rho:
-                print(f"Above max rho for more than {patience_max_rho} steps")
-                break
-
-            if rho >= train_config_dict["safety_rho"]:
-                num_max_rho += 1
-
-            # Anneal beta.
-            if anneal_beta == "linear":
-                beta = base_beta * min((step + 1) / anneal_beta_max_steps, 1.0)
-            elif anneal_beta == "reverse":
-                beta = base_beta * max((anneal_beta_max_steps - step) / anneal_beta_max_steps, 0.2)
-            else:
-                beta = base_beta
-
-            # Logging outer progress and adjacency matrix
-            adj_true = None
-            bidirected_adj_true = None
-            if (
-                isinstance(dataset, CausalDataset)
-                and dataset.has_adjacency_data_matrix
-                and not hasattr(self, "latent_variables")
-            ):
-                adj_true = dataset.get_adjacency_data_matrix()
-                assert adj_true is not None
-            elif (
-                isinstance(dataset, LatentConfoundedCausalDataset)
-                and dataset.has_directed_adjacency_data_matrix
-                and dataset.has_bidirected_adjacency_data_matrix
-            ):
-                adj_true = dataset.get_directed_adjacency_data_matrix()
-                bidirected_adj_true = dataset.get_bidirected_adjacency_data_matrix()
-
+            count += 1
             # Inner loop
-            print(f"Auglag Step: {step}")
-
-            print(f"Beta Value: {beta}")
-
-            # Optimize adjacency for fixed rho and alpha
-            outer_step_start_time = time.time()
-            done_inner, tracker_loss_terms = self.optimize_inner_auglag(
-                rho, alpha, beta, step, num_samples, dataloader, train_config_dict, adj_true, bidirected_adj_true
-            )
-            outer_step_time = time.time() - outer_step_start_time
-            # dag_penalty = np.mean(tracker_loss_terms["penalty_dag"])
-
-            # Print some stats about the DAG distribution
-            # print(f"Dag penalty after inner: {dag_penalty:.10f}")
-            print("Time taken for this step", outer_step_time)
-            # try:
-            #     directed_adjacency, bidirected_adjacency = cast(Any, self).get_admg_matrices(
-            #         do_round=False, most_likely_graph=True, samples=1
-            #     )
-            #     print("Unrounded directed matrix:")
-            #     print(directed_adjacency)
-            #     print("Unrounded bidirected matrix:")
-            #     print(bidirected_adjacency)
-
-            # except AttributeError:
-            #     matrix = self.get_adj_matrix(do_round=True, most_likely_graph=True, samples=1)
-            #     prob_matrix = self.get_adj_matrix(do_round=False, most_likely_graph=True, samples=1)
-            #     print("Unrounded adj matrix:")
-            #     print(prob_matrix)
-            #     print(f"Number of edges in adj matrix (unrounded) {prob_matrix.sum()}, (rounded) {matrix.sum()}.")
-
-            # # Update alpha (and possibly rho) if inner optimization done or if 2 consecutive not-done
-            # if done_inner or num_not_done == 1:
-            #     num_not_done = 0
-            #     if dag_penalty < train_config_dict["tol_dag"]:
-            #         num_below_tol += 1
-            #     if report_progress_callback is not None:
-            #         report_progress_callback(self.model_id, step + 1, train_config_dict["max_steps_auglag"])
-
-            #     with torch.no_grad():
-            #         if dag_penalty > dag_penalty_prev * progress_rate:
-            #             print(f"Updating rho, dag penalty prev: {dag_penalty_prev: .10f}")
-            #             rho *= 10.0
-            #         else:
-            #             print("Updating alpha.")
-            #             dag_penalty_prev = dag_penalty
-            #             alpha += rho * dag_penalty
-            #             if dag_penalty == 0.0:
-            #                 alpha *= 5
-            #         if rho >= train_config_dict["safety_rho"]:
-            #             alpha *= 5
-            #         rho = min([rho, train_config_dict["safety_rho"]])
-            #         alpha = min([alpha, train_config_dict["safety_alpha"]])
-
-            # else:
-            #     num_not_done += 1
-            #     print("Not done inner optimization.")
-
-            if (
-                isinstance(dataset, LatentConfoundedCausalDataset)
-                and dataset.has_directed_adjacency_data_matrix
-                and dataset.has_bidirected_adjacency_data_matrix
-            ):
-                directed_adj_pred, bidirected_adj_pred = cast(Any, self).get_admg_matrices(do_round=True, samples=100)
-                directed_adj_metrics = edge_prediction_metrics_multisample(adj_true, directed_adj_pred)
-                bidirected_adj_metrics = edge_prediction_metrics_multisample(bidirected_adj_true, bidirected_adj_pred)
-                adj_metrics = {
-                    **{f"directed_{k}": v for k, v in directed_adj_metrics.items()},
-                    **{f"bidirected_{k}": v for k, v in bidirected_adj_metrics.items()},
-                }
-            elif isinstance(dataset, CausalDataset) and dataset.has_adjacency_data_matrix:
-                adj_matrix = self.get_adj_matrix(do_round=True, samples=100)
-                if isinstance(dataset, TemporalDataset):
-                    adj_metrics = eval_temporal_causal_discovery(
-                        dataset, self, disable_diagonal_eval=self.disable_diagonal_eval
-                    )
-                    if dataset.has_val_data:
-                        val_likelihood = self._compute_val_likelihood(
-                            val_dataloader, Nsamples_per_graph=100, most_likely_graph=False
-                        )
-                        adj_metrics["val_likelihood"] = val_likelihood
-                    assert adj_true is not None
-                    print_AR_DECI_metrics(adj_metrics, is_aggregated=(adj_true.ndim == 2))
-                    # Update metrics dict and save
-                    update_AR_DECI_metrics_dict(metrics_dict, adj_metrics, is_aggregated=(adj_true.ndim == 2))
-                    save_json(metrics_dict, path=os.path.join(self.save_dir, "metrics.json"))
-
-                else:
-                    subgraph_mask = dataset.get_known_subgraph_mask_matrix()
-                    adj_metrics = edge_prediction_metrics_multisample(
-                        adj_true,
-                        adj_matrix,
-                        adj_matrix_mask=subgraph_mask,
-                        compute_mean=False,
-                    )
-            else:
-                adj_metrics = {}
-            # Calculating the log prob as the average over the terms in the tracker
-            # and saving if it's better than the previous best.
-            avg_tracker_log_px = np.mean(tracker_loss_terms["log_p_x"])
-            self.log_p_x.fill_(avg_tracker_log_px)
-            if avg_tracker_log_px > best_log_p_x:
-                print(f"Saved new best checkpoint with {self.log_p_x} instead of {best_log_p_x}")
-                self.save(best=True)
-                best_log_p_x = avg_tracker_log_px
-
-            base_idx = _log_epoch_metrics(writer, tracker_loss_terms, adj_metrics, step, outer_step_time, base_idx)
-
-            # Save model
-            self.save()
-
-            # # Print the current values of the auglag parameters rho, alpha
-            # if dag_penalty_prev is not None:
-            #     print(f"Dag penalty: {dag_penalty:.15f}")
-            #     print(f"Rho: {rho:.2f}, alpha: {alpha:.2f}")
-
-    def optimize_inner_auglag(
-        self,
-        rho: float,
-        alpha: float,
-        beta: float,
-        step: int,
-        num_samples: int,
-        dataloader,
-        train_config_dict: Optional[Dict[str, Any]] = None,
-        adj_true: Optional[np.ndarray] = None,
-        bidirected_adj_true: Optional[np.ndarray] = None,
-        n_spline_sample: int = 32,
-        spline_ewma_alpha: float = 0.05,
-    ) -> Tuple[bool, Dict]:
-        """
-        Optimize for a given alpha and rho
-        Args:
-            rho: Parameter used to scale the penalty_dag term in the prior. Defaults to None.
-            alpha: Parameter used to scale the penalty_dag term in the prior. Defaults to None.
-            beta: KL term annealing coefficient
-            step: Auglag step
-            num_samples: Number of samples in the dataset
-            dataloader: Dataset to generate a dataloader for.
-            train_config_dict: Dictionary with training hyperparameters.
-            adj_true: ground truth adj matrix
-            bidirected_adj_true: ground truth bidirected adj matrix
-            n_spline_samples: to estimate the non-zero mean of the spline noise distributions by sampling. These are
-                aggregated using an exponentially weighted moving average.
-            alpha: exponentially weighted moving average parameter for spline means.
-
-        Returns:
-            done_opt: boolean indicating if optimization is done.
-            tracker_loss_terms: Dictionary for tracking loss terms
-        """
-        if train_config_dict is None:
-            train_config_dict = {}
-
-        def get_lr():
-            for param_group in self.opt.param_groups:
-                return param_group["lr"]
-
-        def set_lr(factor):
-            for param_group in self.opt.param_groups:
-                param_group["lr"] = param_group["lr"] * factor
-
-        def initialize_lr():
-            base_lr = train_config_dict["learning_rate"]
-            for param_group in self.opt.param_groups:
-                name = param_group["name"]
-                param_group["lr"] = train_config_dict.get(f"{name}_learning_rate", base_lr)
-
-        lim_updates_down = 3
-        num_updates_lr_down = 0
-        auglag_inner_early_stopping_lag = train_config_dict.get("auglag_inner_early_stopping_lag", 1500)
-        auglag_inner_reduce_lr_lag = train_config_dict.get("auglag_inner_reduce_lr_lag", 500)
-        initialize_lr()
-        print("LR:", get_lr())
-        best_loss = np.nan
-        last_updated = -1
-        done_opt = False
-
-        tracker_loss_terms: Dict = defaultdict(list)
-        inner_step = 0
-
-        while inner_step < train_config_dict["max_auglag_inner_epochs"]:  # and not done_steps:
-
+            print(f"Auglag Epoch: {step}")
             for x, mask_train_batch in dataloader:
                 input_mask, _ = get_input_and_scoring_masks(
                     mask_train_batch,
@@ -1720,201 +1493,44 @@ class DECI(
                     score_reconstruction=True,
                 )
                 loss, tracker_loss_terms = self.compute_loss(
-                    step,
                     x,
                     mask_train_batch,
                     input_mask,
                     num_samples,
                     tracker_loss_terms,
-                    train_config_dict,
-                    alpha,
-                    rho,
-                    adj_true,
-                    bidirected_adj_true=bidirected_adj_true,
-                    beta=beta,
-                    compute_cd_fscore=train_config_dict.get("compute_cd_fscore", False),
+                    train_config_dict
                 )
                 self.opt.zero_grad()
                 loss.backward()
                 self.opt.step()
 
-                # For MSE metric, update an estimate of the spline means
-                if not isinstance(self.likelihoods["continuous"], (GaussianBase, TemporalConditionalSplineFlow)):
-                    error_dist_mean = self.likelihoods["continuous"].sample(n_spline_sample).mean(0)
-                    self.spline_mean_ewma = (
-                        spline_ewma_alpha * error_dist_mean + (1 - spline_ewma_alpha) * self.spline_mean_ewma
-                    )
 
                 inner_step += 1
 
                 if int(inner_step) % 100 == 0:
                     self.print_tracker(inner_step, tracker_loss_terms)
-                if int(inner_step) % 500 == 0:
-                    break
-                elif inner_step >= train_config_dict["max_auglag_inner_epochs"]:
-                    break
-
-            # Save if loss improved
-            if np.isnan(best_loss) or np.mean(tracker_loss_terms["loss"][-10:]) < best_loss:
-                best_loss = np.mean(tracker_loss_terms["loss"][-10:])
-                best_inner_step = inner_step
-            # Check if has to reduce step size
-            if (
-                inner_step >= best_inner_step + auglag_inner_reduce_lr_lag
-                and inner_step >= last_updated + auglag_inner_reduce_lr_lag
-            ):
-                last_updated = inner_step
-                num_updates_lr_down += 1
-                set_lr(0.1)
-                print(f"Reducing lr to {get_lr():.5f}")
-                if num_updates_lr_down >= 2:
-                    done_opt = True
-                if num_updates_lr_down >= lim_updates_down:
-                    done_opt = True
-                    print(f"Exiting at inner step {inner_step}.")
-                    # done_steps = True
-                    break
-            if inner_step >= best_inner_step + auglag_inner_early_stopping_lag:
-                done_opt = True
-                print(f"Exiting at inner step {inner_step}.")
-                # done_steps = True
+            mse_sample = self.run_inference_with_dataloader(val_dataloader, infer_config_dict)
+            val_mse = mse_sample.mean()
+            if val_mse < best_mse:
+                self.save(best=True)
+                print(f"Saved new best checkpoint with {val_mse} instead of {best_mse}")
+                best_mse = val_mse
+                count = 0
+            if count > patience:
                 break
-            if np.any(np.isnan(tracker_loss_terms["loss"])):
-                print(tracker_loss_terms)
-                print("Loss is nan, I'm done.", flush=True)
-                # done_steps = True
-                break
-        self.print_tracker(inner_step, tracker_loss_terms)
-        print(f"Best model found at innner step {best_inner_step}, with Loss {best_loss:.2f}")
-        return done_opt, tracker_loss_terms
-
-    def posterior_expected_optimal_policy(
-        self,
-        X: torch.Tensor,
-        intervention_idxs: Union[torch.Tensor, np.ndarray],
-        objective_function: Callable[
-            [
-                Union[torch.Tensor, np.ndarray],
-                Optional[Union[torch.Tensor, np.ndarray]],
-                Optional[Union[torch.Tensor, np.ndarray]],
-                Optional[Union[torch.Tensor, np.ndarray]],
-                int,
-                bool,
-            ],
-            torch.Tensor,
-        ],
-        num_posterior_samples: int = 100,
-        most_likely_graph: bool = False,
-        budget: Optional[torch.Tensor] = None,
-        reference_intervention: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes optimal actions to maximise the objective function under the posterior, subject to a budget.
-
-        The `intervention_idxs` should index binary features. The `budget` is a tensor of the same length as
-        `intervention_idxs` indicating the maximum number of times each treatment can be applied.
-        If `budget` is `None`, then we solve an unconstrained problem.
-
-        The optimisation problem we solve is
-
-            max_{a₁, ..., aₙ} Σᵢ E[objective_function(X, aᵢ, reference_intervention, graph)]
-            subject to Σᵢ 1(aᵢⱼ = 1) ≤ budgetⱼ for each j in intervention_idxs
-                        Σⱼ 1(aᵢⱼ = 1) ≤ 1 for each i
-
-        We return both the optimised values and optimised intervention actions.
-
-        To run this function using ITE as an objective function, set
-
-            objective_function = lambda *args: model.ite(*args)[0][target_col, ...]
-
-        Args:
-            X: tensor of shape (num_samples, processed_dim_all) containing the contexts that we wish to obtain the optimal action for
-            intervention_idxs: tensor of shape (num_interventions) containing indices of groups that will be considered as actionable intervention.
-                These must reference groups consisting solely of binary variables.
-            objective_function: a function from batches of shape (batch, processed_dim_all) to objective outcomes of shape (batch).
-                The objective function can incorporate counterfactual calculation or CATE samples conditional on the provided graph.
-                It may also consume an optional `reference_intervention` for use calculating CATE/ITE.
-                The arguments to the function are expected to be: `X`, `intervention_idxs`, `intervention_values`, `reference_values`,
-                `num_posterior_samples`, `most_likely_graph`. Thus, `model.ite` can be used directly as an objective function.
-            num_posterior_samples: the number of samples of the graph posterior to sample when estimating expectations.
-            most_likely_graph: whether to use only the most likely graph (deterministic). This requires `num_posterior_samples=1`.
-            budget: a tensor of shape (num_interventions) of budget constraints. The budget indicates the maximum number of times each treatment
-                can be applied. If `None`, an unconstrained problem is solved.
-
-        Returns:
-            optimal_actions: tensor of shape (num_samples, processed_dim_actions) containing the optimal actions
-            optimal_values: tensor of shape (num_samples) containing the posterior expected values attained by applying the specified
-                actions
-        """
-        # Convert groups to variables
-        intervention_variables = [j for i in intervention_idxs for j in self.variables.group_idxs[i]]
-        # Check actions are binary
-        assert all(
-            self.variables[i].type_ == "binary" for i in intervention_variables
-        ), "This method only supports binary treatments."
-
-        # Calculate outcome matrix of doing each action to each partner
-        num_interventions = len(intervention_variables)
-        one_hots = torch.nn.functional.one_hot(torch.arange(num_interventions), num_interventions).unbind(0)
-        objective_values_list = [
-            objective_function(
-                X,
-                intervention_idxs,
-                one_hot,
-                reference_intervention,
-                num_posterior_samples,
-                most_likely_graph,
-            )
-            for one_hot in one_hots
-        ]
-
-        # Solve with scipy
-        objective_matrix = np.stack(objective_values_list, axis=-1)
-        assignments, _ = col_row_constrained_lin_prog(objective_matrix, budget.numpy() if budget else None)
-        optimal_values = np.sum(assignments * objective_matrix, axis=1)
-
-        return assignments, optimal_values
+            
+            if outer_step_start_time!=None:
+                outer_step_time = time.time() - outer_step_start_time
+                print("Time taken for this epoch", outer_step_time)
+            
+            outer_step_start_time = time.time()
+            # adjust_learning_rate
+            lr = base_lr *(0.5 ** ((step - 1) // 1))
+            for param_group in self.opt.param_groups:
+                param_group['lr'] = lr
+        self.save()
 
 
-# Auxiliary method that logs training metrics to AML and tensorboard
-def _log_epoch_metrics(
-    writer: SummaryWriter,
-    tracker_loss_terms: dict,
-    adj_metrics: Optional[dict],
-    step: int,
-    epoch_time: float,
-    base_idx: int = 0,
-):
-    """
-    Logging method for DECI training loop
-    Args:
-        writer: tensorboard summarywriter used to log experiment results
-        tracker_loss_terms: dictionary containing arrays with values generated at each inner-step during the inner optimisation procedure
-        adj_metrics: Optional dictionary with adjacency matrix discovery metrics
-        step: outer step number
-        epoch_time: time it took to perform outer step,
-        base_idx: cummulative inner step number
-    """
 
-    # iterate over tracker vectors
-    advance_base_idx = 0
-    for key, value_list in tracker_loss_terms.items():
-        mlflow.log_metric(f"step_mean_{key}", np.mean(value_list), step=step)
 
-        for i, value in enumerate(value_list):
-            writer.add_scalar(f"step_{step}_{key}", value, i)  # tensorboard
-            writer.add_scalar(key, value, i + base_idx)  # tensorboard
-        advance_base_idx = len(value_list)
 
-    base_idx += advance_base_idx  # should only happen once
-
-    # Log time
-    mlflow.log_metric("step_time", epoch_time, step=step)
-    writer.add_scalar("step_time", epoch_time, step)
-
-    # log adjacency matrix metrics
-    if adj_metrics is not None:
-        for key, value in adj_metrics.items():
-            writer.add_scalar(key + "_mean", np.mean(value), step)  # tensorboard
-            writer.add_scalar(key + "std", np.std(value), step)  # tensorboard
-
-    return base_idx

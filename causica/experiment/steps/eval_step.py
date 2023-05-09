@@ -62,6 +62,7 @@ def run_eval_sample(
         os.path.join(result_path, "results.json")
     )
     mlflow.log_metric("impute/running-time", (dt.datetime.utcnow() - start_time).total_seconds() / 60)
+    return results
 
 def run_eval_main(
     model: IModelForImputation,

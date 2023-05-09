@@ -1,0 +1,15 @@
+artifact_uri: file:///data/shuqili/nni_causica/mlruns/0/3ec993ba4e9646bd9fb735371e69941c/artifacts
+end_time: 1683341231707
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 3ec993ba4e9646bd9fb735371e69941c
+run_name: illness.rhino
+run_uuid: 3ec993ba4e9646bd9fb735371e69941c
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1683341231658
+status: 4
+tags: []
+user_id: shuqili

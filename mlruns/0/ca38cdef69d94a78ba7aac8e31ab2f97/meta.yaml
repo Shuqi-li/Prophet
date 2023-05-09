@@ -1,0 +1,15 @@
+artifact_uri: file:///data/shuqili/nni_causica/mlruns/0/ca38cdef69d94a78ba7aac8e31ab2f97/artifacts
+end_time: 1683516658755
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: ca38cdef69d94a78ba7aac8e31ab2f97
+run_name: weather.rhino_informer
+run_uuid: ca38cdef69d94a78ba7aac8e31ab2f97
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1683516610303
+status: 4
+tags: []
+user_id: shuqili

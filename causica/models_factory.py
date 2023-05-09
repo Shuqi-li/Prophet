@@ -32,6 +32,10 @@ from .models.deci.deci_gaussian import DECIGaussian
 from .models.deci.deci_spline import DECISpline
 from .models.deci.fold_time_deci import FoldTimeDECI
 from .models.deci.rhino import Rhino
+from .models.deci.rhino_autoformer import Rhino_Auto
+from .models.deci.rhino_informer import Rhino_Informer
+from .models.deci.rhino_timesnet import Rhino_TimeS
+from .models.deci.rhino_estformer import Rhino_EST
 from .models.imodel import IModel
 from .models.point_net import PointNet, SparsePointNet
 from .models.set_encoder_base_model import SetEncoderBaseModel
@@ -45,6 +49,10 @@ MODEL_SUBCLASSES: Dict[str, Type[IModel]] = {
     for model in (
         # Models
         Rhino,
+        Rhino_Auto,
+        Rhino_Informer,
+        Rhino_TimeS,
+        Rhino_EST,
         DECI,
         VISL,
         DECIGaussian,
